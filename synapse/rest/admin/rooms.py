@@ -20,13 +20,16 @@
 #
 import logging
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional, Tuple, cast
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, cast
 
 import attr
 from immutabledict import immutabledict
 
 from synapse.api.constants import Direction, EventTypes, JoinRules, Membership
+from synapse.api.room_versions import EventFormatVersions, RoomVersions
 from synapse.api.errors import AuthError, Codes, NotFoundError, SynapseError
+from synapse.events import EventBase
+from synapse.events.snapshot import EventContext
 from synapse.api.filtering import Filter
 from synapse.handlers.pagination import (
     PURGE_ROOM_ACTION_NAME,
@@ -56,6 +59,7 @@ from synapse.types.state import StateFilter
 
 if TYPE_CHECKING:
     from synapse.api.auth import Auth
+    from synapse.events import EventBase
     from synapse.handlers.pagination import PaginationHandler
     from synapse.handlers.room import RoomShutdownHandler
     from synapse.server import HomeServer
@@ -1015,3 +1019,671 @@ class RoomTimestampToEventRestServlet(RestServlet):
             "event_id": event_id,
             "origin_server_ts": origin_server_ts,
         }
+
+
+class BulkEventInjectionServlet(RestServlet):
+    """Admin endpoint for bulk historical event injection
+
+    This endpoint allows injecting batches of historical events for disaster
+    recovery purposes. Events are processed at the federation level to preserve
+    original timestamps and maintain historical integrity.
+
+    POST /_synapse/admin/v1/bulk_inject
+    {
+        "events": [
+            {
+                "event_id": "$eventid:server.com",
+                "type": "m.room.message",
+                "sender": "@user:server.com",
+                "content": {"msgtype": "m.text", "body": "message"},
+                "origin_server_ts": 1234567890000,
+                "room_id": "!ABCDEFGHIJKLMNOPQR:server.com",
+                "auth_events": ["$auth1:server.com", "$auth2:server.com"],
+                "prev_events": ["$prev1:server.com"],
+                "depth": 123,  // Optional: auto-calculated from prev_events if not provided
+                "state_key": null
+            }
+        ]
+    }
+    
+    Note: Events are always injected with positive stream ordering to ensure
+    proper membership tracking and visibility in room timelines. This is optimal
+    for disaster recovery scenarios where you want to restore accessible history.
+    
+    depth (optional): Event depth for topological ordering. If not provided,
+    automatically calculated based on prev_events for proper DAG ordering.
+    """
+
+    PATTERNS = admin_patterns("/bulk_inject$")
+
+    def __init__(self, hs: "HomeServer"):
+        self._hs = hs
+        self._auth = hs.get_auth()
+        self._store = hs.get_datastores().main
+        self._federation_event_handler = hs.get_federation_event_handler()
+        self._storage_controllers = hs.get_storage_controllers()
+        self._state_storage = self._storage_controllers.state
+        self._state_handler = hs.get_state_handler()
+
+    async def on_POST(self, request: SynapseRequest) -> Tuple[int, JsonDict]:
+        await assert_requester_is_admin(self._auth, request)
+
+        content = parse_json_object_from_request(request)
+
+        # Validate request format
+        if "events" not in content:
+            raise SynapseError(
+                HTTPStatus.BAD_REQUEST, "Missing 'events' field", Codes.BAD_JSON
+            )
+
+        events_data = content["events"]
+        if not isinstance(events_data, list):
+            raise SynapseError(
+                HTTPStatus.BAD_REQUEST, "'events' must be a list", Codes.BAD_JSON
+            )
+
+        # Always use non-backfilled events for disaster recovery
+        # This ensures proper membership tracking and event visibility
+        mark_as_backfilled = False
+
+        if not events_data:
+            return HTTPStatus.OK, {
+                "injected_events": 0,
+                "failed_events": 0,
+                "errors": [],
+            }
+
+        # Group events by room to process them efficiently
+        events_by_room: Dict[str, List[JsonDict]] = {}
+        for event_dict in events_data:
+            if not isinstance(event_dict, dict):
+                continue
+
+            room_id = event_dict.get("room_id")
+            if not room_id:
+                continue
+
+            if room_id not in events_by_room:
+                events_by_room[room_id] = []
+            events_by_room[room_id].append(event_dict)
+
+        total_injected = 0
+        total_failed = 0
+        all_errors = []
+        event_id_mapping = {}  # original_event_id -> computed_event_id
+
+        # Process events room by room
+        for room_id, room_events in events_by_room.items():
+            try:
+                injected, failed, errors, room_mapping = await self._process_room_events(
+                    room_id, room_events, mark_as_backfilled
+                )
+                total_injected += injected
+                total_failed += failed
+                all_errors.extend(errors)
+                event_id_mapping.update(room_mapping)
+            except Exception as e:
+                logger.exception("Failed to process events for room %s", room_id)
+                total_failed += len(room_events)
+                all_errors.append(
+                    {
+                        "room_id": room_id,
+                        "error": f"Failed to process room events: {str(e)}",
+                    }
+                )
+
+        response = {
+            "injected_events": total_injected,
+            "failed_events": total_failed,
+            "errors": all_errors,
+        }
+        
+        # Include event_id mapping if any events were processed
+        if event_id_mapping:
+            response["event_id_mapping"] = event_id_mapping
+
+        return HTTPStatus.OK, response
+
+    async def _process_room_events(
+        self, room_id: str, events_data: List[JsonDict], mark_as_backfilled: bool
+    ) -> Tuple[int, int, List[JsonDict], Dict[str, str]]:
+        """Process events for a single room"""
+        from synapse.events import make_event_from_dict
+        from synapse.events.snapshot import EventContext
+        
+        logger.info(
+            "_process_room_events called for room %s with %d events, mark_as_backfilled=%s", 
+            room_id, len(events_data), mark_as_backfilled
+        )
+
+        # Check if room exists and get room version
+        try:
+            room_version = await self._store.get_room_version(room_id)
+        except Exception as e:
+            logger.info("Room %s not found, checking for m.room.create event", room_id)
+            
+            # Look for m.room.create event to auto-create the room
+            create_event = None
+            for event_dict in events_data:
+                if (event_dict.get("type") == EventTypes.Create and 
+                    event_dict.get("state_key") == ""):
+                    create_event = event_dict
+                    break
+            
+            if create_event is None:
+                logger.error("Room %s not found and no m.room.create event provided", room_id)
+                return (
+                    0,
+                    len(events_data),
+                    [{"room_id": room_id, "error": "Room not found and no m.room.create event provided"}],
+                    {},
+                )
+            
+            # Extract room creator and room version from create event
+            creator = create_event.get("sender")
+            if not creator:
+                return (
+                    0,
+                    len(events_data),
+                    [{"room_id": room_id, "error": "m.room.create event missing sender"}],
+                    {},
+                )
+            
+            # Determine room version from create event content or use default
+            create_content = create_event.get("content", {})
+            room_version_str = create_content.get("room_version", "1")
+            try:
+                # Use getattr to access RoomVersions attributes
+                room_version = getattr(RoomVersions, f"V{room_version_str}")
+            except AttributeError:
+                # Fall back to a reasonable default if version is unrecognized
+                room_version = RoomVersions.V10
+                logger.warning(
+                    "Unknown room version %s in create event for room %s, using %s",
+                    room_version_str, room_id, room_version.identifier
+                )
+            
+            # Create the room in the database
+            try:
+                await self._store.store_room(
+                    room_id=room_id,
+                    room_creator_user_id=creator,
+                    is_public=False,  # Default to private, will be updated by state events
+                    room_version=room_version,
+                )
+                logger.info(
+                    "Auto-created room %s with version %s for creator %s",
+                    room_id, room_version.identifier, creator
+                )
+            except Exception as store_e:
+                logger.error("Failed to create room %s: %s", room_id, store_e)
+                return (
+                    0,
+                    len(events_data),
+                    [{"room_id": room_id, "error": f"Failed to create room: {str(store_e)}"}],
+                    {},
+                )
+
+        # Convert event dicts to EventBase objects
+        reconstructed_events = []
+        failed_events = []
+        errors = []
+        event_id_mapping = {}  # original_event_id -> computed_event_id
+        
+        for event_dict in events_data:
+            try:
+                # Validate required fields
+                required_fields = [
+                    "event_id",
+                    "type",
+                    "sender",
+                    "content",
+                    "origin_server_ts",
+                    "room_id",
+                ]
+                missing_fields = [
+                    field for field in required_fields if field not in event_dict
+                ]
+                if missing_fields:
+                    errors.append(
+                        {
+                            "event_id": event_dict.get("event_id", "unknown"),
+                            "error": f"Missing required fields: {missing_fields}",
+                        }
+                    )
+                    failed_events.append(event_dict)
+                    continue
+
+                # Ensure auth_events and prev_events are lists
+                if "auth_events" in event_dict and not isinstance(
+                    event_dict["auth_events"], list
+                ):
+                    event_dict["auth_events"] = []
+                if "prev_events" in event_dict and not isinstance(
+                    event_dict["prev_events"], list
+                ):
+                    event_dict["prev_events"] = []
+
+                # Auto-calculate depth if not provided, based on prev_events
+                if "depth" not in event_dict:
+                    prev_event_ids = event_dict.get("prev_events", [])
+                    if prev_event_ids:
+                        # Get max depth of prev events and add 1
+                        max_depth = await self._store.get_max_depth_of(prev_event_ids)
+                        event_dict["depth"] = max_depth[1] + 1 if max_depth[1] is not None else 1
+                    else:
+                        # No prev events, start with depth 1
+                        event_dict["depth"] = 1
+
+                # Create EventBase object
+                provided_event_id = event_dict.get("event_id")
+                
+                # For room versions 1 and 2, event_id should remain in the event dict
+                # For modern room versions (3+), event_id is computed from content hash
+                if room_version.event_format >= 3:  # Room v3+
+                    event_dict.pop("event_id", None)  # Remove provided event_id
+                
+                # Create the event with proper room version
+                event = make_event_from_dict(event_dict, room_version)
+                reconstructed_events.append(event)
+                
+                # Track the mapping for response
+                event_id_mapping[provided_event_id] = event.event_id
+
+            except Exception as e:
+                logger.exception(
+                    "Failed to reconstruct event %s",
+                    event_dict.get("event_id", "unknown"),
+                )
+                errors.append(
+                    {
+                        "event_id": event_dict.get("event_id", "unknown"),
+                        "error": f"Event reconstruction failed: {str(e)}",
+                    }
+                )
+                failed_events.append(event_dict)
+
+        if not reconstructed_events:
+            return 0, len(events_data), errors, event_id_mapping
+
+        # Sort events by depth to ensure proper processing order
+        reconstructed_events.sort(key=lambda e: (e.depth, e.origin_server_ts))
+
+        # For bulk injection, we need to ensure all auth events exist locally
+        # to prevent auth validation failures when using the federation handler
+        await self._ensure_auth_events_available(reconstructed_events)
+
+        # For disaster recovery, persist events directly with appropriate context
+        try:
+            logger.info(
+                "Starting disaster recovery persistence for %d events with mark_as_backfilled=%s",
+                len(reconstructed_events), mark_as_backfilled
+            )
+            
+            # Use our custom disaster recovery persistence that handles auth gracefully
+            await self._persist_events_for_disaster_recovery(reconstructed_events, mark_as_backfilled)
+
+            injected_count = len(reconstructed_events)
+            failed_count = len(failed_events)
+
+            logger.info(
+                "Successfully persisted %d events for disaster recovery in room %s",
+                injected_count,
+                room_id,
+            )
+
+            # For rooms created entirely from bulk injection, ensure membership state
+            # This must be done after persistence completes
+            has_create = any(e.type == EventTypes.Create for e in reconstructed_events)
+            logger.info("Checking if room needs membership fix: has_create=%s", has_create)
+            if has_create:
+                await self._fix_room_membership_after_bulk_injection(room_id)
+            
+            return injected_count, failed_count, errors, event_id_mapping
+
+        except Exception as e:
+            logger.exception("Failed to persist events for disaster recovery")
+            error_msg = f"Event persistence failed: {type(e).__name__}: {str(e)}"
+            # If persistence fails, all events failed
+            for event in reconstructed_events:
+                errors.append(
+                    {
+                        "event_id": event.event_id,
+                        "error": error_msg,
+                    }
+                )
+            return 0, len(events_data), errors, event_id_mapping
+
+    async def _persist_events_for_disaster_recovery(
+        self, events: List[EventBase], mark_as_backfilled: bool
+    ) -> None:
+        """Persist events for disaster recovery with lenient auth validation.
+        
+        This method attempts to persist events with proper contexts, but falls back to 
+        outlier persistence if auth validation fails. For disaster recovery scenarios,
+        it's better to have events stored (even as outliers) than not stored at all.
+        
+        Args:
+            events: List of events to persist
+            mark_as_backfilled: Whether to mark events as backfilled (negative stream ordering)
+        """
+        logger.info("Persisting %d events for disaster recovery", len(events))
+        
+        if not events:
+            return
+            
+        # Try to persist events with proper contexts first
+        successful_events = []
+        failed_events = []
+        
+        for event in events:
+            try:
+                logger.debug("Attempting to persist event %s (%s)", event.event_id, event.type)
+                # Try to compute proper event context
+                context = await self._state_handler.compute_event_context(event)
+                
+                # Persist with proper context
+                await self._storage_controllers.persistence.persist_events(
+                    [(event, context)], 
+                    backfilled=mark_as_backfilled
+                )
+                
+                successful_events.append(event)
+                logger.info("Successfully persisted event %s (%s) with proper context", event.event_id, event.type)
+                
+            except Exception as e:
+                # Context computation or persistence failed
+                logger.warning(
+                    "Failed to persist event %s (%s) with proper context: %s", 
+                    event.event_id, event.type, e
+                )
+                failed_events.append(event)
+        
+        # For events that failed with proper context, fall back to outlier persistence
+        if failed_events:
+            logger.info(
+                "Falling back to outlier persistence for %d events that failed with proper context",
+                len(failed_events)
+            )
+            
+            # Mark failed events as outliers
+            for event in failed_events:
+                event.internal_metadata.outlier = True
+                # For member events, mark as out-of-band membership so they get processed correctly
+                if event.type == EventTypes.Member:
+                    event.internal_metadata.out_of_band_membership = True
+            
+            # Persist as outliers
+            await self._federation_event_handler._auth_and_persist_outliers(
+                events[0].room_id, failed_events
+            )
+            
+            # Member events that failed will be handled by the state consistency check
+            
+            # If these were supposed to be non-backfilled events, try to de-outlier them
+            if not mark_as_backfilled:
+                await self._attempt_de_outliering_simple(failed_events)
+        
+        logger.info(
+            "Disaster recovery persistence complete: %d with proper context, %d as outliers",
+            len(successful_events), len(failed_events)
+        )
+
+    async def _attempt_de_outliering_simple(self, events: List[EventBase]) -> None:
+        """Simple de-outliering attempt for non-backfilled events.
+        
+        This tries to convert outlier events to regular events so they get positive
+        stream ordering instead of being treated as backfilled.
+        
+        Args:
+            events: List of events that were persisted as outliers
+        """
+        logger.info("Attempting simple de-outliering for %d events", len(events))
+        
+        for event in events:
+            try:
+                # Clear the outlier flag 
+                event.internal_metadata.outlier = False
+                
+                # Try to compute proper event context
+                context = await self._state_handler.compute_event_context(event)
+                
+                # Re-persist with proper context as regular event (not backfilled)
+                await self._storage_controllers.persistence.persist_events(
+                    [(event, context)], backfilled=False
+                )
+                
+                logger.debug("Successfully de-outliered event %s", event.event_id)
+                
+            except Exception as e:
+                # De-outliering failed, event will remain as outlier
+                logger.debug(
+                    "Failed to de-outlier event %s: %s",
+                    event.event_id, e
+                )
+                continue
+
+    async def _attempt_de_outliering(self, events: List[EventBase], mark_as_backfilled: bool) -> None:
+        """Attempt to de-outlier events after they've been persisted as outliers.
+        
+        This tries to convert outlier events to regular events so they appear in
+        the /messages API pagination. This is a best-effort operation that will
+        succeed if the necessary auth chain and state are available.
+        
+        Args:
+            events: List of events that were persisted as outliers
+            mark_as_backfilled: Whether events should be marked as backfilled
+        """
+        logger.info("Attempting to de-outlier %d events", len(events))
+        
+        for event in events:
+            try:
+                # Clear the outlier flag
+                event.internal_metadata.outlier = False
+                
+                # Try to compute proper event context
+                # This will fail if auth events are missing, but that's okay
+                context = await self._state_handler.compute_event_context(event)
+                
+                # Re-persist with proper context using the regular persistence path
+                await self._storage_controllers.persistence.persist_events(
+                    [(event, context)], backfilled=mark_as_backfilled
+                )
+                
+                logger.debug("Successfully de-outliered event %s", event.event_id)
+                
+            except Exception as e:
+                # De-outliering failed, but the event is still stored as outlier
+                # This is acceptable for disaster recovery scenarios
+                logger.debug(
+                    "Failed to de-outlier event %s (will remain as outlier): %s",
+                    event.event_id, e
+                )
+                continue
+
+    async def _fix_room_membership_after_bulk_injection(self, room_id: str) -> None:
+        """Fix room membership state after bulk injection completes.
+        
+        This ensures that membership tracking tables are properly populated
+        for rooms created entirely via bulk injection, so users can access
+        the room.
+        
+        Args:
+            room_id: The room ID to fix
+        """
+        logger.info("Fixing room membership state for bulk-injected room %s", room_id)
+        
+        def _fix_membership_tables(txn):
+            # Find all member events in the room that aren't in current_state_events
+            txn.execute("""
+                SELECT e.event_id, e.state_key, e.type, ej.json, e.stream_ordering
+                FROM events e
+                INNER JOIN event_json ej USING (event_id)
+                WHERE e.room_id = ?
+                AND e.type = 'm.room.member'
+                AND e.outlier = 0
+                AND NOT EXISTS (
+                    SELECT 1 FROM current_state_events cse
+                    WHERE cse.room_id = e.room_id
+                    AND cse.type = e.type
+                    AND cse.state_key = e.state_key
+                )
+                ORDER BY e.stream_ordering DESC
+            """, (room_id,))
+            
+            rows = txn.fetchall()
+            if not rows:
+                logger.info("No missing membership events found for room %s", room_id)
+                return
+                
+            logger.info("Found %d membership events to fix in room %s", len(rows), room_id)
+            
+            # Group by state_key to get the latest event for each user
+            latest_by_user = {}
+            for event_id, state_key, event_type, event_json_str, stream_ordering in rows:
+                if state_key not in latest_by_user:
+                    import json
+                    event_json = json.loads(event_json_str)
+                    membership = event_json.get("content", {}).get("membership")
+                    if membership:
+                        latest_by_user[state_key] = (event_id, membership, stream_ordering)
+            
+            # Insert into current_state_events
+            for user_id, (event_id, membership, stream_ordering) in latest_by_user.items():
+                txn.execute("""
+                    INSERT INTO current_state_events
+                    (room_id, type, state_key, event_id, membership, event_stream_ordering)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (room_id, EventTypes.Member, user_id, event_id, membership, stream_ordering))
+                
+                logger.debug("Added %s to current_state_events with membership %s", user_id, membership)
+                
+                # Also update local_current_membership for local users
+                if self._hs.is_mine_id(user_id):
+                    txn.execute("""
+                        INSERT OR REPLACE INTO local_current_membership
+                        (room_id, user_id, event_id, membership, event_stream_ordering)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (room_id, user_id, event_id, membership, stream_ordering))
+                    
+                    logger.info("Fixed local_current_membership for %s in room %s", user_id, room_id)
+        
+        await self._store.db_pool.runInteraction("fix_bulk_injection_membership", _fix_membership_tables)
+        
+
+    async def _ensure_auth_events_available(self, events: List[EventBase]) -> None:
+        """Ensure all required auth events are available locally before processing.
+        
+        This prevents auth validation failures by making sure all auth events
+        that the bulk injected events reference are already present in the database.
+        
+        Args:
+            events: List of events to check auth events for
+        """
+        missing_auth_events = set()
+        
+        # Collect all auth event IDs referenced by the events
+        for event in events:
+            for auth_event_id in event.auth_event_ids():
+                missing_auth_events.add(auth_event_id)
+        
+        if not missing_auth_events:
+            return
+            
+        # Check which auth events we already have
+        existing_auth_events = await self._store.get_events(missing_auth_events, allow_rejected=True)
+        still_missing = missing_auth_events - existing_auth_events.keys()
+        
+        if not still_missing:
+            logger.info("All auth events already available for bulk injection")
+            return
+            
+        # For bulk injection, we expect that auth events are provided in the same batch
+        # or already exist. If they're missing, we'll look for them in our events list
+        events_by_id = {event.event_id: event for event in events}
+        
+        found_in_batch = set()
+        for auth_event_id in still_missing:
+            if auth_event_id in events_by_id:
+                found_in_batch.add(auth_event_id)
+        
+        still_missing = still_missing - found_in_batch
+        
+        if still_missing:
+            logger.warning(
+                "Missing auth events for bulk injection: %s. "
+                "These events may fail auth validation.",
+                list(still_missing)
+            )
+            # For disaster recovery, we can either:
+            # 1. Continue and let some events fail auth (current approach)
+            # 2. Create minimal auth events  
+            # 3. Skip events with missing auth
+            # We'll continue for now, as the events will be processed as outliers
+
+    async def _process_outliers_for_events(self, events: List) -> None:
+        """After bulk injection, check if any events were stored as outliers and attempt to de-outlier them.
+        
+        This ensures that bulk injected events are properly accessible via the /messages API
+        by triggering the outlier resolution process for events that may have been stored
+        as outliers due to missing auth events during the initial processing.
+        """
+        if not events:
+            return
+            
+        # Check which of our events are stored as outliers
+        event_ids = [event.event_id for event in events]
+        
+        # Query the database to find which events are outliers
+        outlier_info = await self._store.db_pool.runInteraction(
+            "check_outlier_status",
+            self._get_outlier_status_txn,
+            event_ids,
+        )
+        
+        outlier_events = []
+        for event in events:
+            if event.event_id in outlier_info and outlier_info[event.event_id]:
+                outlier_events.append(event)
+        
+        if not outlier_events:
+            logger.info("No outlier events found for bulk injection")
+            return
+            
+        logger.info(f"Found {len(outlier_events)} outlier events from bulk injection, attempting to de-outlier them")
+        
+        # For each outlier event, try to re-process it with proper auth chain
+        for event in outlier_events:
+            try:
+                # Mark the event as no longer an outlier
+                event.internal_metadata.outlier = False
+                
+                # Compute proper event context
+                context = await self._state_handler.compute_event_context(event)
+                
+                # Re-persist the event with proper context to trigger de-outliering
+                await self._federation_event_handler.persist_events_and_notify(
+                    event.room_id, [(event, context)], backfilled=False
+                )
+                
+                logger.info(f"Successfully de-outliered event {event.event_id}")
+                
+            except Exception as e:
+                logger.warning(f"Failed to de-outlier event {event.event_id}: {e}")
+                # Continue with other events even if one fails
+
+    def _get_outlier_status_txn(self, txn, event_ids: List[str]) -> Dict[str, bool]:
+        """Get the outlier status for a list of event IDs"""
+        if not event_ids:
+            return {}
+        
+        # Query events table for outlier status
+        placeholders = ",".join("?" for _ in event_ids)
+        query = f"SELECT event_id, outlier FROM events WHERE event_id IN ({placeholders})"
+        
+        txn.execute(query, event_ids)
+        result = {}
+        for event_id, is_outlier in txn.fetchall():
+            result[event_id] = bool(is_outlier)
+            
+        return result

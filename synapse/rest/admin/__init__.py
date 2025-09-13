@@ -72,6 +72,7 @@ from synapse.rest.admin.registration_tokens import (
 )
 from synapse.rest.admin.rooms import (
     BlockRoomRestServlet,
+    BulkEventInjectionServlet,
     DeleteRoomStatusByDeleteIdRestServlet,
     DeleteRoomStatusByRoomIdRestServlet,
     ForwardExtremitiesRestServlet,
@@ -283,6 +284,7 @@ def register_servlets(hs: "HomeServer", http_server: HttpServer) -> None:
 
     register_servlets_for_client_rest_resource(hs, http_server)
     BlockRoomRestServlet(hs).register(http_server)
+    BulkEventInjectionServlet(hs).register(http_server)
     ListRoomRestServlet(hs).register(http_server)
     RoomStateRestServlet(hs).register(http_server)
     RoomRestV2Servlet(hs).register(http_server)

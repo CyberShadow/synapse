@@ -2353,6 +2353,15 @@ class StreamWorkerStore(EventsWorkerStore, SQLBaseStore):
             "bounds": bounds,
             "order": order,
         }
+        
+        # Debug logging for event visibility investigation
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"DEBUG_PAGINATION: SQL={sql}")
+        logger.info(f"DEBUG_PAGINATION: args={args}")
+        logger.info(f"DEBUG_PAGINATION: room_id={room_id}, direction={direction}")
+        logger.info(f"DEBUG_PAGINATION: from_token={from_token}, to_token={to_token}")
+        
         txn.execute(sql, args)
 
         # Get all the rows and check if we hit the limit.
