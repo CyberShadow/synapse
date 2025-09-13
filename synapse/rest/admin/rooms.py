@@ -1192,9 +1192,11 @@ class BulkEventInjectionServlet(RestServlet):
             # Determine room version from create event content or use default
             create_content = create_event.get("content", {})
             room_version_str = create_content.get("room_version", "1")
+            logger.info("Found room_version_str=%s for room %s", room_version_str, room_id)
             try:
                 # Use getattr to access RoomVersions attributes
                 room_version = getattr(RoomVersions, f"V{room_version_str}")
+                logger.info("Successfully got room_version=%s for room %s", room_version.identifier, room_id)
             except AttributeError:
                 # Fall back to a reasonable default if version is unrecognized
                 room_version = RoomVersions.V10
@@ -1302,6 +1304,7 @@ class BulkEventInjectionServlet(RestServlet):
                     }
                 )
                 failed_events.append(event_dict)
+                print(f"DEBUG: Failed to reconstruct event {event_dict.get('event_id', 'unknown')}: {e}")
 
         if not reconstructed_events:
             return 0, len(events_data), errors, event_id_mapping
@@ -1335,8 +1338,10 @@ class BulkEventInjectionServlet(RestServlet):
             # For rooms created entirely from bulk injection, ensure membership state
             # This must be done after persistence completes
             has_create = any(e.type == EventTypes.Create for e in reconstructed_events)
-            logger.info("Checking if room needs membership fix: has_create=%s", has_create)
+            print(f"DEBUG BulkEventInjection: Checking if room needs membership fix: has_create={has_create} for room {room_id}")
+            print(f"DEBUG BulkEventInjection: Event types: {[e.type for e in reconstructed_events]}")
             if has_create:
+                print(f"DEBUG BulkEventInjection: Calling _fix_room_membership_after_bulk_injection for room {room_id}")
                 await self._fix_room_membership_after_bulk_injection(room_id)
             
             return injected_count, failed_count, errors, event_id_mapping
@@ -1357,77 +1362,219 @@ class BulkEventInjectionServlet(RestServlet):
     async def _persist_events_for_disaster_recovery(
         self, events: List[EventBase], mark_as_backfilled: bool
     ) -> None:
-        """Persist events for disaster recovery with lenient auth validation.
+        """Persist events for disaster recovery with direct database insertion.
         
-        This method attempts to persist events with proper contexts, but falls back to 
-        outlier persistence if auth validation fails. For disaster recovery scenarios,
-        it's better to have events stored (even as outliers) than not stored at all.
+        For disaster recovery of entire rooms, we need to bypass normal event
+        validation since we're restoring a complete room state from backup.
+        This directly inserts events into the database with proper state tracking.
         
         Args:
             events: List of events to persist
             mark_as_backfilled: Whether to mark events as backfilled (negative stream ordering)
         """
+        import json
+        
         logger.info("Persisting %d events for disaster recovery", len(events))
         
         if not events:
             return
             
-        # Try to persist events with proper contexts first
-        successful_events = []
-        failed_events = []
+        room_id = events[0].room_id
         
-        for event in events:
-            try:
-                logger.debug("Attempting to persist event %s (%s)", event.event_id, event.type)
-                # Try to compute proper event context
-                context = await self._state_handler.compute_event_context(event)
+        # For complete room recovery, we need to insert events directly
+        # This bypasses auth validation which would fail for orphaned events
+        print(f"DEBUG _persist_events: Using direct insertion for {len(events)} events")
+        
+        # Get the next stream ordering
+        def _insert_events_txn(txn):
+            # Get next stream ordering
+            stream_gen = self._store._stream_id_gen
+            stream_orderings = []
+            
+            for event in events:
+                stream_ordering = stream_gen.get_next_txn(txn)
+                stream_orderings.append(stream_ordering)
                 
-                # Persist with proper context
-                await self._storage_controllers.persistence.persist_events(
-                    [(event, context)], 
-                    backfilled=mark_as_backfilled
+                # Insert into events table
+                self._store.db_pool.simple_insert_txn(
+                    txn,
+                    table="events",
+                    values={
+                        "event_id": event.event_id,
+                        "room_id": event.room_id,
+                        "type": event.type,
+                        "sender": event.sender,
+                        "state_key": event.state_key if hasattr(event, 'state_key') else None,
+                        "depth": event.depth,
+                        "stream_ordering": stream_ordering,
+                        "topological_ordering": event.depth,  # Use depth as topological ordering
+                        "origin_server_ts": event.origin_server_ts,
+                        "received_ts": event.origin_server_ts,
+                        "outlier": False,  # Not an outlier
+                        "processed": True,
+                        "instance_name": "master",
+                    },
                 )
                 
-                successful_events.append(event)
-                logger.info("Successfully persisted event %s (%s) with proper context", event.event_id, event.type)
-                
-            except Exception as e:
-                # Context computation or persistence failed
-                logger.warning(
-                    "Failed to persist event %s (%s) with proper context: %s", 
-                    event.event_id, event.type, e
+                # Insert into event_json table
+                self._store.db_pool.simple_insert_txn(
+                    txn,
+                    table="event_json",
+                    values={
+                        "event_id": event.event_id,
+                        "room_id": event.room_id,
+                        "internal_metadata": "{}",
+                        "json": json.dumps(event.get_dict()),
+                        "format_version": event.room_version.event_format,
+                    },
                 )
-                failed_events.append(event)
-        
-        # For events that failed with proper context, fall back to outlier persistence
-        if failed_events:
-            logger.info(
-                "Falling back to outlier persistence for %d events that failed with proper context",
-                len(failed_events)
+                
+                # Insert auth events
+                for auth_id in event.auth_event_ids():
+                    self._store.db_pool.simple_insert_txn(
+                        txn,
+                        table="event_auth",
+                        values={
+                            "event_id": event.event_id,
+                            "auth_id": auth_id,
+                            "room_id": event.room_id,
+                        },
+                    )
+                
+                # Insert prev events
+                for prev_id in event.prev_event_ids():
+                    self._store.db_pool.simple_insert_txn(
+                        txn,
+                        table="event_edges",
+                        values={
+                            "event_id": event.event_id,
+                            "prev_event_id": prev_id,
+                            "room_id": event.room_id,
+                        },
+                    )
+                
+                # Handle state events
+                if hasattr(event, 'state_key'):
+                    # This is a state event
+                    self._store.db_pool.simple_insert_txn(
+                        txn,
+                        table="state_events",
+                        values={
+                            "event_id": event.event_id,
+                            "room_id": event.room_id,
+                            "type": event.type,
+                            "state_key": event.state_key,
+                        },
+                    )
+                    
+                    # Insert into current_state_events
+                    self._store.db_pool.simple_upsert_txn(
+                        txn,
+                        table="current_state_events",
+                        keyvalues={
+                            "room_id": event.room_id,
+                            "type": event.type,
+                            "state_key": event.state_key,
+                        },
+                        values={
+                            "event_id": event.event_id,
+                            "membership": event.content.get("membership") if event.type == EventTypes.Member else None,
+                            "event_stream_ordering": stream_ordering,
+                        },
+                    )
+                    
+                    # Handle membership events for local users
+                    if event.type == EventTypes.Member and self._hs.is_mine_id(event.state_key):
+                        membership = event.content.get("membership")
+                        if membership:
+                            self._store.db_pool.simple_upsert_txn(
+                                txn,
+                                table="local_current_membership",
+                                keyvalues={
+                                    "room_id": event.room_id,
+                                    "user_id": event.state_key,
+                                },
+                                values={
+                                    "event_id": event.event_id,
+                                    "membership": membership,
+                                },
+                            )
+                            
+                            # Also insert into room_memberships
+                            self._store.db_pool.simple_insert_txn(
+                                txn,
+                                table="room_memberships",
+                                values={
+                                    "event_id": event.event_id,
+                                    "user_id": event.state_key,
+                                    "sender": event.sender,
+                                    "room_id": event.room_id,
+                                    "membership": membership,
+                                    "event_stream_ordering": stream_ordering,
+                                },
+                            )
+                
+                print(f"DEBUG _persist_events: Inserted event {event.event_id} ({event.type}) stream_ordering={stream_ordering}")
+            
+            # For each event, we need to create a state group
+            # This is required for sync to work properly
+            # Get the next state group ID by finding the max and adding 1
+            txn.execute("SELECT COALESCE(MAX(id), 0) FROM state_groups")
+            max_state_group = txn.fetchone()[0]
+            state_group_id = max_state_group + 1
+            
+            # Insert state group for the room
+            self._store.db_pool.simple_insert_txn(
+                txn,
+                table="state_groups",
+                values={
+                    "id": state_group_id,
+                    "room_id": room_id,
+                    "event_id": events[-1].event_id,  # Last event in batch
+                },
             )
             
-            # Mark failed events as outliers
-            for event in failed_events:
-                event.internal_metadata.outlier = True
-                # For member events, mark as out-of-band membership so they get processed correctly
-                if event.type == EventTypes.Member:
-                    event.internal_metadata.out_of_band_membership = True
+            # Map each event to the state group
+            for event in events:
+                self._store.db_pool.simple_insert_txn(
+                    txn,
+                    table="event_to_state_groups",
+                    values={
+                        "event_id": event.event_id,
+                        "state_group": state_group_id,
+                    },
+                )
             
-            # Persist as outliers
-            await self._federation_event_handler._auth_and_persist_outliers(
-                events[0].room_id, failed_events
-            )
-            
-            # Member events that failed will be handled by the state consistency check
-            
-            # If these were supposed to be non-backfilled events, try to de-outlier them
-            if not mark_as_backfilled:
-                await self._attempt_de_outliering_simple(failed_events)
+            # Update forward extremities
+            if events:
+                # Clear existing forward extremities
+                txn.execute(
+                    "DELETE FROM event_forward_extremities WHERE room_id = ?",
+                    (room_id,)
+                )
+                
+                # Set the last event as forward extremity
+                last_event = events[-1]
+                self._store.db_pool.simple_insert_txn(
+                    txn,
+                    table="event_forward_extremities",
+                    values={
+                        "event_id": last_event.event_id,
+                        "room_id": room_id,
+                    },
+                )
         
-        logger.info(
-            "Disaster recovery persistence complete: %d with proper context, %d as outliers",
-            len(successful_events), len(failed_events)
+        await self._store.db_pool.runInteraction(
+            "disaster_recovery_insert_events",
+            _insert_events_txn
         )
+        
+        # Clear caches - these might not have invalidate_all() method
+        # TODO: Find proper way to invalidate these caches
+        # self._store.get_rooms_for_user.invalidate_all()
+        # self._store.get_rooms_for_local_user_where_membership_is.invalidate_all()
+        
+        print(f"DEBUG _persist_events: Direct insertion complete for {len(events)} events")
 
     async def _attempt_de_outliering_simple(self, events: List[EventBase]) -> None:
         """Simple de-outliering attempt for non-backfilled events.
@@ -1511,64 +1658,183 @@ class BulkEventInjectionServlet(RestServlet):
         Args:
             room_id: The room ID to fix
         """
-        logger.info("Fixing room membership state for bulk-injected room %s", room_id)
+        print(f"DEBUG _fix_room_membership: Called for room {room_id}")
+        
+        # First, ensure we have proper current state for the room
+        # This is critical for rooms created entirely from bulk injection
+        await self._ensure_room_has_current_state(room_id)
+        
         
         def _fix_membership_tables(txn):
-            # Find all member events in the room that aren't in current_state_events
+            # Find all member events in the room (including outliers)
+            # Note: We specifically include outliers because bulk injection may store events as outliers
             txn.execute("""
-                SELECT e.event_id, e.state_key, e.type, ej.json, e.stream_ordering
+                SELECT e.event_id, e.state_key, e.type, ej.json, e.stream_ordering, e.outlier
                 FROM events e
                 INNER JOIN event_json ej USING (event_id)
                 WHERE e.room_id = ?
                 AND e.type = 'm.room.member'
-                AND e.outlier = 0
-                AND NOT EXISTS (
-                    SELECT 1 FROM current_state_events cse
-                    WHERE cse.room_id = e.room_id
-                    AND cse.type = e.type
-                    AND cse.state_key = e.state_key
-                )
-                ORDER BY e.stream_ordering DESC
+                ORDER BY e.stream_ordering DESC, e.outlier ASC
             """, (room_id,))
             
             rows = txn.fetchall()
             if not rows:
-                logger.info("No missing membership events found for room %s", room_id)
+                print(f"DEBUG _fix_membership: No membership events found for room {room_id}")
                 return
                 
-            logger.info("Found %d membership events to fix in room %s", len(rows), room_id)
+            print(f"DEBUG _fix_membership: Found {len(rows)} membership events in room {room_id}")
+            for event_id, state_key, event_type, event_json_str, stream_ordering, is_outlier in rows[:5]:  # Show first 5
+                print(f"DEBUG _fix_membership:   Event {event_id} for {state_key}, outlier={is_outlier}, stream={stream_ordering}")
+            
+            # Check if we already have current_state_events for this room
+            txn.execute("""
+                SELECT COUNT(*) FROM current_state_events
+                WHERE room_id = ? AND type = 'm.room.member'
+            """, (room_id,))
+            existing_count = txn.fetchone()[0]
+            
+            if existing_count > 0:
+                logger.info("Room %s already has %d membership entries in current_state_events", 
+                           room_id, existing_count)
             
             # Group by state_key to get the latest event for each user
             latest_by_user = {}
-            for event_id, state_key, event_type, event_json_str, stream_ordering in rows:
-                if state_key not in latest_by_user:
-                    import json
-                    event_json = json.loads(event_json_str)
-                    membership = event_json.get("content", {}).get("membership")
-                    if membership:
-                        latest_by_user[state_key] = (event_id, membership, stream_ordering)
-            
-            # Insert into current_state_events
-            for user_id, (event_id, membership, stream_ordering) in latest_by_user.items():
-                txn.execute("""
-                    INSERT INTO current_state_events
-                    (room_id, type, state_key, event_id, membership, event_stream_ordering)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (room_id, EventTypes.Member, user_id, event_id, membership, stream_ordering))
-                
-                logger.debug("Added %s to current_state_events with membership %s", user_id, membership)
-                
-                # Also update local_current_membership for local users
-                if self._hs.is_mine_id(user_id):
-                    txn.execute("""
-                        INSERT OR REPLACE INTO local_current_membership
-                        (room_id, user_id, event_id, membership, event_stream_ordering)
-                        VALUES (?, ?, ?, ?, ?)
-                    """, (room_id, user_id, event_id, membership, stream_ordering))
+            for event_id, state_key, event_type, event_json_str, stream_ordering, is_outlier in rows:
+                # Skip if we already have a later event for this user
+                if state_key in latest_by_user:
+                    continue
                     
-                    logger.info("Fixed local_current_membership for %s in room %s", user_id, room_id)
+                import json
+                event_json = json.loads(event_json_str)
+                membership = event_json.get("content", {}).get("membership")
+                if membership:
+                    latest_by_user[state_key] = (event_id, membership, stream_ordering, is_outlier)
+            
+            # Update current_state_events for missing entries
+            for user_id, (event_id, membership, stream_ordering, is_outlier) in latest_by_user.items():
+                # Check if this user already has an entry
+                txn.execute("""
+                    SELECT event_id FROM current_state_events
+                    WHERE room_id = ? AND type = ? AND state_key = ?
+                """, (room_id, EventTypes.Member, user_id))
+                
+                existing = txn.fetchone()
+                if not existing:
+                    # Insert new entry
+                    txn.execute("""
+                        INSERT INTO current_state_events
+                        (room_id, type, state_key, event_id, membership, event_stream_ordering)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (room_id, EventTypes.Member, user_id, event_id, membership, stream_ordering))
+                    
+                    logger.info("Added %s to current_state_events with membership %s", user_id, membership)
+                
+                # Always update local_current_membership for local users
+                if self._hs.is_mine_id(user_id):
+                    # First check if entry exists
+                    txn.execute("""
+                        SELECT event_id FROM local_current_membership
+                        WHERE room_id = ? AND user_id = ?
+                    """, (room_id, user_id))
+                    
+                    existing_local = txn.fetchone()
+                    
+                    if existing_local:
+                        # Update existing entry
+                        txn.execute("""
+                            UPDATE local_current_membership
+                            SET event_id = ?, membership = ?
+                            WHERE room_id = ? AND user_id = ?
+                        """, (event_id, membership, room_id, user_id))
+                        logger.info("Updated local_current_membership for %s in room %s", user_id, room_id)
+                    else:
+                        # Insert new entry
+                        txn.execute("""
+                            INSERT INTO local_current_membership
+                            (room_id, user_id, event_id, membership)
+                            VALUES (?, ?, ?, ?)
+                        """, (room_id, user_id, event_id, membership))
+                        logger.info("Inserted local_current_membership for %s in room %s", user_id, room_id)
         
         await self._store.db_pool.runInteraction("fix_bulk_injection_membership", _fix_membership_tables)
+        
+    async def _ensure_room_has_current_state(self, room_id: str) -> None:
+        """Ensure a room has entries in current_state_events table.
+        
+        This is needed for rooms created entirely via bulk injection, as they
+        might not have gone through the normal state resolution process.
+        """
+        # Check if room has any current state
+        has_state = await self._store.db_pool.simple_select_one_onecol(
+            table="current_state_events",
+            keyvalues={"room_id": room_id},
+            retcol="COUNT(*)",
+            desc="check_room_has_state",
+        )
+        
+        if has_state > 0:
+            print(f"DEBUG _ensure_room_has_current_state: Room {room_id} already has {has_state} current state events")
+            return
+            
+        print(f"DEBUG _ensure_room_has_current_state: Room {room_id} has no current state, populating from events")
+        
+        # Get all state events for the room
+        rows = await self._store.db_pool.simple_select_list(
+            table="events",
+            keyvalues={"room_id": room_id, "outlier": False},
+            retcols=["event_id", "type", "state_key", "stream_ordering"],
+            desc="get_room_state_events",
+        )
+        
+        # Filter to only state events (have state_key)
+        state_events = [row for row in rows if row["state_key"] is not None]
+        
+        if not state_events:
+            logger.warning("No state events found for room %s", room_id)
+            return
+            
+        # Group by (type, state_key) to get latest event
+        latest_state = {}
+        for row in state_events:
+            key = (row["type"], row["state_key"])
+            if key not in latest_state or row["stream_ordering"] > latest_state[key]["stream_ordering"]:
+                latest_state[key] = row
+        
+        # Insert into current_state_events
+        for (event_type, state_key), row in latest_state.items():
+            event_id = row["event_id"]
+            stream_ordering = row["stream_ordering"]
+            
+            # Get membership if this is a member event
+            membership = None
+            if event_type == EventTypes.Member:
+                # Get the event JSON from event_json table
+                event_json_row = await self._store.db_pool.simple_select_one(
+                    table="event_json",
+                    keyvalues={"event_id": event_id},
+                    retcols=["json"],
+                    desc="get_event_json_for_membership",
+                    allow_none=True,
+                )
+                if event_json_row:
+                    import json
+                    event_data = json.loads(event_json_row["json"])
+                    membership = event_data.get("content", {}).get("membership")
+            
+            await self._store.db_pool.simple_insert(
+                table="current_state_events",
+                values={
+                    "event_id": event_id,
+                    "room_id": room_id,
+                    "type": event_type,
+                    "state_key": state_key,
+                    "membership": membership,
+                    "event_stream_ordering": stream_ordering,
+                },
+                desc="populate_current_state",
+            )
+            
+        logger.info("Populated %d current state events for room %s", len(latest_state), room_id)
         
 
     async def _ensure_auth_events_available(self, events: List[EventBase]) -> None:
