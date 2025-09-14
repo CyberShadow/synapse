@@ -1142,6 +1142,389 @@ root:
         finally:
             self.stop_synapse()
             print(f"\nTest files left in: {self.temp_dir}")
+
+    def test_encrypted_room_recovery(self):
+        """Test recovery of encrypted room messages."""
+        print("\n=== TEST: Encrypted Room Recovery ===")
+        
+        try:
+            # Setup
+            self.setup()
+            self.start_synapse()
+            self.register_user()
+            
+            # Create encrypted room
+            room_response = self._make_request(
+                "POST",
+                f"http://localhost:{self.port}/_matrix/client/r0/createRoom",
+                headers={"Authorization": f"Bearer {self.access_token}"},
+                data={
+                    "name": "Encrypted Room",
+                    "initial_state": [{
+                        "type": "m.room.encryption",
+                        "state_key": "",
+                        "content": {
+                            "algorithm": "m.megolm.v1.aes-sha2"
+                        }
+                    }]
+                }
+            )
+            room_id = room_response["room_id"]
+            print(f"Created encrypted room: {room_id}")
+            
+            # Send an unencrypted message first (before encryption is fully set up)
+            self.send_message(room_id, "Message before encryption")
+            
+            # Backup database
+            backup_path = self.backup_database()
+            
+            # Simulate encrypted messages (in real scenario, these would be properly encrypted)
+            # For testing, we'll send messages with encrypted-like content
+            encrypted_events = []
+            
+            # Add a normal message that would be encrypted in a real scenario
+            event1 = {
+                "event_id": f"$enc1:{self.server_name}",
+                "type": "m.room.encrypted",
+                "sender": self.user_id,
+                "room_id": room_id,
+                "content": {
+                    "algorithm": "m.megolm.v1.aes-sha2",
+                    "ciphertext": "AwgAEnA...encrypted_payload_1...",
+                    "device_id": "TESTDEVICE",
+                    "sender_key": "test_sender_key_1",
+                    "session_id": "test_session_1"
+                },
+                "origin_server_ts": int(time.time() * 1000)
+            }
+            encrypted_events.append(event1)
+            
+            # Add another encrypted message
+            time.sleep(0.1)
+            event2 = {
+                "event_id": f"$enc2:{self.server_name}",
+                "type": "m.room.encrypted", 
+                "sender": self.user_id,
+                "room_id": room_id,
+                "content": {
+                    "algorithm": "m.megolm.v1.aes-sha2",
+                    "ciphertext": "AwgAEnB...encrypted_payload_2...",
+                    "device_id": "TESTDEVICE",
+                    "sender_key": "test_sender_key_2",
+                    "session_id": "test_session_2"
+                },
+                "origin_server_ts": int(time.time() * 1000)
+            }
+            encrypted_events.append(event2)
+            
+            # Simulate disaster - restore from backup
+            self.stop_synapse()
+            self.restore_database(backup_path)
+            self.start_synapse()
+            self.login()
+            
+            # Inject encrypted events
+            response = self.inject_room_events(room_id, encrypted_events)
+            print(f"Injection response: {response}")
+            assert response["injected_events"] == 2, f"Expected to inject 2 events, got {response}"
+            
+            # Verify encrypted messages are in timeline
+            time.sleep(1)
+            messages = self.get_room_messages(room_id)
+            
+            encrypted_count = 0
+            for msg in messages:
+                if msg.get("type") == "m.room.encrypted":
+                    encrypted_count += 1
+                    # Verify encrypted content structure is preserved
+                    content = msg.get("content", {})
+                    assert "algorithm" in content, "Missing encryption algorithm"
+                    assert "ciphertext" in content, "Missing ciphertext"
+                    assert content["algorithm"] == "m.megolm.v1.aes-sha2"
+            
+            assert encrypted_count == 2, f"Expected 2 encrypted messages, found {encrypted_count}"
+            
+            # Verify room is still marked as encrypted
+            state_response = self._make_request(
+                "GET",
+                f"http://localhost:{self.port}/_matrix/client/r0/rooms/{room_id}/state/m.room.encryption",
+                headers={"Authorization": f"Bearer {self.access_token}"}
+            )
+            assert state_response["algorithm"] == "m.megolm.v1.aes-sha2", "Room encryption state lost"
+            
+            # Test that new messages can still be sent (would be encrypted in real client)
+            self.send_message(room_id, "New message after recovery")
+            
+            print("✓ Encrypted room recovery test passed")
+            
+        finally:
+            self.stop_synapse()
+            print(f"\nTest files left in: {self.temp_dir}")
+
+    def test_state_conflict_recovery(self):
+        """Test recovery when there are conflicting state events."""
+        print("\n=== TEST: State Event Conflicts During Recovery ===")
+        
+        try:
+            # Setup
+            self.setup()
+            self.start_synapse()
+            
+            # Register admin and regular user
+            self.register_user()  # admin
+            
+            # Register a regular user
+            user_nonce_response = self._make_request("GET", f"http://localhost:{self.port}/_synapse/admin/v1/register")
+            user_nonce = user_nonce_response["nonce"]
+            
+            import hmac
+            import hashlib
+            user_mac = hmac.new(
+                b"test_secret",
+                f"{user_nonce}\x00user\x00user_pass\x00notadmin".encode(),
+                hashlib.sha1
+            ).hexdigest()
+            
+            user_response = self._make_request(
+                "POST",
+                f"http://localhost:{self.port}/_synapse/admin/v1/register",
+                data={"nonce": user_nonce, "username": "user", "password": "user_pass", "admin": False, "mac": user_mac}
+            )
+            user_token = user_response["access_token"]
+            user_id = "@user:localhost"
+            
+            # Create room as admin
+            room_id = self.create_room()
+            
+            # Set initial topic
+            self._make_request(
+                "PUT",
+                f"http://localhost:{self.port}/_matrix/client/r0/rooms/{room_id}/state/m.room.topic",
+                headers={"Authorization": f"Bearer {self.access_token}"},
+                data={"topic": "Important Meeting"}
+            )
+            
+            # Invite and join user to room
+            self._make_request(
+                "POST",
+                f"http://localhost:{self.port}/_matrix/client/r0/rooms/{room_id}/invite",
+                headers={"Authorization": f"Bearer {self.access_token}"},
+                data={"user_id": user_id}
+            )
+            
+            # User joins the room
+            self.join_room(room_id, user_token)
+            
+            # Backup database
+            backup_path = self.backup_database()
+            
+            # Promote user to power level 50
+            self._make_request(
+                "PUT",
+                f"http://localhost:{self.port}/_matrix/client/r0/rooms/{room_id}/state/m.room.power_levels",
+                headers={"Authorization": f"Bearer {self.access_token}"},
+                data={
+                    "users": {
+                        self.user_id: 100,  # Admin stays at 100
+                        user_id: 50         # User gets 50
+                    },
+                    "events": {
+                        "m.room.topic": 50  # Topic requires level 50
+                    }
+                }
+            )
+            
+            # User changes topic (now has permission)
+            self._make_request(
+                "PUT",
+                f"http://localhost:{self.port}/_matrix/client/r0/rooms/{room_id}/state/m.room.topic",
+                headers={"Authorization": f"Bearer {user_token}"},
+                data={"topic": "Casual Chat"}
+            )
+            
+            # Admin changes topic again (higher power level)
+            self._make_request(
+                "PUT",
+                f"http://localhost:{self.port}/_matrix/client/r0/rooms/{room_id}/state/m.room.topic",
+                headers={"Authorization": f"Bearer {self.access_token}"},
+                data={"topic": "Executive Meeting"}
+            )
+            
+            # Get all state events that happened after backup
+            all_events = self.get_all_room_events(room_id)
+            
+            # Find the conflicting topic events
+            topic_events = []
+            power_level_event = None
+            
+            for event in all_events:
+                if event.get("type") == "m.room.topic":
+                    topic = event.get("content", {}).get("topic", "")
+                    if topic in ["Casual Chat", "Executive Meeting"]:
+                        topic_events.append(event)
+                elif event.get("type") == "m.room.power_levels" and event.get("content", {}).get("users", {}).get(user_id) == 50:
+                    power_level_event = event
+                    
+            print(f"Found {len(topic_events)} topic events to recover")
+            
+            # Simulate disaster
+            self.stop_synapse()
+            self.restore_database(backup_path)
+            self.start_synapse()
+            self.login()
+            
+            # Inject power level change and conflicting topic events
+            events_to_inject = []
+            if power_level_event:
+                events_to_inject.append(power_level_event)
+            events_to_inject.extend(topic_events)
+            
+            response = self.inject_room_events(room_id, events_to_inject)
+            print(f"Injection response: {response}")
+            
+            # Verify the final state - admin's topic should win due to higher power level
+            time.sleep(1)
+            state_response = self._make_request(
+                "GET",
+                f"http://localhost:{self.port}/_matrix/client/r0/rooms/{room_id}/state/m.room.topic",
+                headers={"Authorization": f"Bearer {self.access_token}"}
+            )
+            
+            final_topic = state_response.get("topic", "")
+            print(f"Final topic after state resolution: {final_topic}")
+            
+            # The admin's "Executive Meeting" should be the final state
+            assert final_topic == "Executive Meeting", f"Expected 'Executive Meeting', got '{final_topic}'"
+            
+            # Verify we can still change the topic
+            self._make_request(
+                "PUT",
+                f"http://localhost:{self.port}/_matrix/client/r0/rooms/{room_id}/state/m.room.topic",
+                headers={"Authorization": f"Bearer {self.access_token}"},
+                data={"topic": "Post-Recovery Meeting"}
+            )
+            
+            print("✓ State conflict recovery test passed")
+            
+        finally:
+            self.stop_synapse()
+            print(f"\nTest files left in: {self.temp_dir}")
+
+    def test_redaction_recovery(self):
+        """Test recovery of redaction events."""
+        print("\n=== TEST: Redaction Event Recovery ===")
+        
+        try:
+            # Setup
+            self.setup()
+            self.start_synapse()
+            self.register_user()
+            
+            # Create room
+            room_id = self.create_room()
+            
+            # Send inappropriate message
+            inappropriate_msg_response = self.send_message(room_id, "Confidential data XYZ")
+            inappropriate_msg = inappropriate_msg_response["event_id"]
+            print(f"Sent inappropriate message: {inappropriate_msg}")
+            
+            # Send normal message
+            normal_msg_response = self.send_message(room_id, "Hello everyone")
+            normal_msg = normal_msg_response["event_id"]
+            
+            # Backup database
+            backup_path = self.backup_database()
+            
+            # Redact the inappropriate message
+            redaction_response = self._make_request(
+                "PUT",
+                f"http://localhost:{self.port}/_matrix/client/r0/rooms/{room_id}/redact/{inappropriate_msg}/{int(time.time()*1000)}",
+                headers={"Authorization": f"Bearer {self.access_token}"},
+                data={"reason": "Contains confidential information"}
+            )
+            redaction_event_id = redaction_response.get("event_id")
+            print(f"Redacted message with event: {redaction_event_id}")
+            
+            # Send follow-up message
+            followup_msg = self.send_message(room_id, "Thanks for removing that")
+            
+            # Get the redaction event for recovery
+            all_events = self.get_all_room_events(room_id)
+            redaction_event = None
+            for event in all_events:
+                if event.get("type") == "m.room.redaction" and event.get("event_id") == redaction_event_id:
+                    redaction_event = event
+                    break
+                    
+            assert redaction_event is not None, "Could not find redaction event"
+            
+            # Verify message is redacted before disaster
+            messages_before = self.get_room_messages(room_id)
+            redacted_before = False
+            for msg in messages_before:
+                if msg.get("event_id") == inappropriate_msg:
+                    # Check if content is redacted
+                    if msg.get("unsigned", {}).get("redacted_because"):
+                        redacted_before = True
+                        break
+                        
+            assert redacted_before, "Message should be redacted before disaster"
+            
+            # Simulate disaster
+            self.stop_synapse()
+            self.restore_database(backup_path)
+            self.start_synapse()
+            self.login()
+            
+            # Verify inappropriate message is visible again
+            messages_after_restore = self.get_room_messages(room_id)
+            message_visible = False
+            for msg in messages_after_restore:
+                if msg.get("event_id") == inappropriate_msg:
+                    content = msg.get("content", {}).get("body", "")
+                    if content == "Confidential data XYZ":
+                        message_visible = True
+                        break
+                        
+            assert message_visible, "Inappropriate message should be visible after restore"
+            
+            # Inject the redaction event
+            response = self.inject_room_events(room_id, [redaction_event])
+            print(f"Injection response: {response}")
+            assert response["injected_events"] == 1, f"Expected to inject 1 event, got {response}"
+            
+            # Verify message is redacted again
+            time.sleep(1)
+            messages_after_injection = self.get_room_messages(room_id)
+            redacted_after = False
+            for msg in messages_after_injection:
+                if msg.get("event_id") == inappropriate_msg:
+                    # Check if content is redacted
+                    if msg.get("unsigned", {}).get("redacted_because"):
+                        redacted_after = True
+                        # Verify reason is preserved
+                        redaction_info = msg["unsigned"]["redacted_because"]
+                        reason = redaction_info.get("content", {}).get("reason", "")
+                        assert reason == "Contains confidential information", f"Expected redaction reason, got '{reason}'"
+                        break
+                        
+            assert redacted_after, "Message should be redacted after injection"
+            
+            # Verify other messages are intact
+            other_messages_intact = False
+            for msg in messages_after_injection:
+                if msg.get("event_id") == normal_msg:
+                    if msg.get("content", {}).get("body") == "Hello everyone":
+                        other_messages_intact = True
+                        break
+                        
+            assert other_messages_intact, "Other messages should remain intact"
+            
+            print("✓ Redaction recovery test passed")
+            
+        finally:
+            self.stop_synapse()
+            print(f"\nTest files left in: {self.temp_dir}")
             
 
     def run_all_tests(self):
@@ -1158,6 +1541,9 @@ root:
             ("Minimal Event Recovery", self.test_minimal_event_recovery),
             ("Missing Events Between Existing", self.test_missing_events_between_existing),
             ("Historical Events Pagination", self.test_historical_events_pagination),
+            ("Encrypted Room Recovery", self.test_encrypted_room_recovery),
+            ("State Conflict Recovery", self.test_state_conflict_recovery),
+            ("Redaction Recovery", self.test_redaction_recovery),
         ]
         
         passed = 0
@@ -1205,11 +1591,17 @@ if __name__ == "__main__":
             test.test_missing_events_between_existing()
         elif test_name == "historical":
             test.test_historical_events_pagination()
+        elif test_name == "encrypted":
+            test.test_encrypted_room_recovery()
+        elif test_name == "state-conflict":
+            test.test_state_conflict_recovery()
+        elif test_name == "redaction":
+            test.test_redaction_recovery()
         elif test_name == "all":
             test.run_all_tests()
         else:
             print(f"Unknown test: {test_name}")
-            print("Available tests: basic, membership, timestamps, functionality, room-after-backup, minimal, missing-between, historical, all")
+            print("Available tests: basic, membership, timestamps, functionality, room-after-backup, minimal, missing-between, historical, encrypted, state-conflict, redaction, all")
     else:
         # Default to basic recovery test
         test.test_basic_recovery()

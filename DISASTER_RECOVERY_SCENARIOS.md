@@ -223,3 +223,214 @@ python test_disaster_recovery_integration.py historical
 podman run --rm -v ".:/synapse" -w /synapse --entrypoint="" localhost/synapse-dev:latest \
   bash -c "PYTHONPATH=/synapse python -u test_disaster_recovery_integration.py all"
 ```
+
+## Scenario 12: Encrypted Room Recovery
+
+**Test Location:** `test_disaster_recovery_integration.py::test_encrypted_room_recovery()`
+
+1. User creates an encrypted room (m.room.encryption state event)
+2. Users exchange encrypted messages using E2E encryption
+3. **Server database is backed up**
+4. More encrypted messages are sent
+5. Device keys are rotated/updated
+6. **Server crashes and database is restored from backup**
+7. Admin extracts lost encrypted messages from external source
+8. **Admin injects encrypted messages via bulk injection API**
+9. **Expected result:**
+   - Encrypted messages are stored correctly
+   - Messages remain encrypted (server cannot decrypt)
+   - Clients with proper keys can decrypt historical messages
+   - Room encryption state is preserved
+   - New encrypted messages can be sent
+
+## Scenario 13: State Event Conflicts During Recovery
+
+**Test Location:** `test_disaster_recovery_integration.py::test_state_conflict_recovery()`
+
+1. Room has power levels: Admin=100, User=0
+2. Admin changes topic to "Important Meeting"
+3. **Server database is backed up**
+4. Admin promotes User to power level 50
+5. User changes topic to "Casual Chat"
+6. Admin changes topic to "Executive Meeting"
+7. **Server crashes and database is restored from backup**
+8. Admin has conflicting topic changes from external source
+9. **Admin injects all state events with proper auth chains**
+10. **Expected result:**
+    - State resolution algorithm correctly resolves conflicts
+    - Final topic reflects the event with highest power level
+    - Room state remains consistent
+    - State timeline is preserved for audit purposes
+
+## Scenario 14: Redaction Event Recovery
+
+**Test Location:** `test_disaster_recovery_integration.py::test_redaction_recovery()`
+
+1. User sends inappropriate message "Confidential data XYZ"
+2. User sends normal message "Hello everyone"
+3. **Server database is backed up**
+4. Moderator redacts the inappropriate message
+5. User sends "Thanks for removing that"
+6. **Server crashes and database is restored from backup**
+7. Inappropriate message is visible again (redaction lost)
+8. Admin extracts redaction event from audit logs
+9. **Admin injects the redaction event**
+10. **Expected result:**
+    - Inappropriate message is redacted again
+    - Redaction reason is preserved
+    - Message content is properly removed
+    - Clients see redacted placeholder
+    - Subsequent messages remain intact
+
+## Scenario 15: Media Event Recovery
+
+**Test Location:** `test_disaster_recovery_integration.py::test_media_event_recovery()` (to be implemented)
+
+1. User uploads image.jpg via media API
+2. User sends m.room.message with m.image referencing the media
+3. **Server database is backed up**
+4. User uploads document.pdf
+5. User sends m.room.message with m.file referencing the document
+6. **Server crashes and database is restored from backup**
+7. Media events are lost but media files may still exist on disk
+8. Admin recovers media events from logs/federation
+9. **Admin injects media message events**
+10. **Expected result:**
+    - Media messages appear in timeline
+    - Media URLs remain valid if files exist
+    - Missing media files show as unavailable
+    - Thumbnails work if still cached
+    - New media can be uploaded
+
+## Scenario 16: Ban/Kick Event Recovery  
+
+**Test Location:** `test_disaster_recovery_integration.py::test_ban_kick_recovery()` (to be implemented)
+
+1. Alice creates a room and invites Bob and Charlie
+2. Bob and Charlie join and participate
+3. **Server database is backed up**
+4. Bob becomes disruptive
+5. Alice kicks Bob from the room
+6. Charlie continues chatting
+7. Bob tries to rejoin but Alice bans Bob
+8. **Server crashes and database is restored from backup**
+9. Bob is back in the room (kick/ban events lost)
+10. Admin extracts kick and ban events
+11. **Admin injects kick and ban membership events**
+12. **Expected result:**
+    - Bob is removed from the room
+    - Bob cannot rejoin (ban is enforced)
+    - Kick/ban reasons are preserved
+    - Audit trail shows moderation actions
+    - Room membership state is correct
+
+## Scenario 17: Invite-Only Room Access Loss
+
+**Test Location:** `test_disaster_recovery_integration.py::test_invite_only_recovery()` (to be implemented)
+
+1. Alice creates private invite-only room
+2. Alice invites Bob and Charlie via direct invites
+3. Bob and Charlie accept invites and join
+4. **Server database is backed up**
+5. Alice invites David
+6. David joins the room
+7. All users exchange messages
+8. **Server crashes and database is restored from backup**
+9. David loses access (his invite and join are lost)
+10. David cannot rejoin without new invite
+11. Admin recovers David's invite and join events
+12. **Admin injects David's membership events**
+13. **Expected result:**
+    - David regains access to the room
+    - David can see all messages
+    - No duplicate invites needed
+    - Room privacy settings maintained
+    - Invite-only restriction still enforced
+
+## Scenario 18: Large-Scale Batch Recovery
+
+**Test Location:** `test_disaster_recovery_integration.py::test_large_batch_recovery()` (to be implemented)
+
+1. Active server with 50+ rooms, 200+ users
+2. Continuous activity across multiple rooms
+3. **Server database is backed up**
+4. Heavy activity period: 10,000+ events across all rooms
+5. Multiple room creations, joins, messages, media uploads
+6. **Server crashes and database is restored from backup**
+7. Thousands of events lost across dozens of rooms
+8. Admin extracts events from distributed sources
+9. **Admin injects 10,000+ events in batches**
+10. **Expected result:**
+    - All rooms restored to correct state
+    - No timeouts or memory issues
+    - Batch processing completes successfully
+    - Event ordering preserved per room
+    - Server performance remains acceptable
+
+## Scenario 19: Room Upgrade Chain Recovery
+
+**Test Location:** `test_disaster_recovery_integration.py::test_room_upgrade_recovery()` (to be implemented)
+
+1. Room v1 exists with history and members
+2. Admin upgrades room to v6 (creates new room with tombstone)
+3. Users migrate to new room, old room is tombstoned
+4. **Server database is backed up**
+5. Activity continues in v6 room
+6. Admin upgrades to v10 for new features
+7. More activity in v10 room
+8. **Server crashes and database is restored from backup**
+9. v10 room doesn't exist, users stuck in v6 room
+10. Admin recovers entire upgrade chain and events
+11. **Admin injects room upgrade events and new room state**
+12. **Expected result:**
+    - Room upgrade chain is restored
+    - Tombstone events point to correct rooms
+    - Users can follow upgrade path
+    - Room versions are correct
+    - Historical messages accessible
+
+## Scenario 20: Partial Room State Recovery
+
+**Test Location:** `test_disaster_recovery_integration.py::test_partial_state_recovery()` (to be implemented)
+
+1. Complex room with multiple state events:
+   - Custom power levels for 10+ users
+   - Room avatar and topic
+   - Guest access and history visibility settings
+   - Server ACLs
+2. **Server database is backed up**
+3. Various state changes occur
+4. **Server crashes with partial database corruption**
+5. Some state events corrupted, others intact
+6. Room partially functional but state inconsistent
+7. Admin identifies corrupted vs intact state
+8. Admin extracts only corrupted state events
+9. **Admin injects only the corrupted state events**
+10. **Expected result:**
+    - Corrupted state is repaired
+    - Intact state remains unchanged
+    - No state duplication
+    - State resolution handles conflicts
+    - Room fully functional
+
+## Scenario 21: Federation Split-Brain Recovery
+
+**Test Location:** `test_disaster_recovery_integration.py::test_federation_split_brain()` (to be implemented)
+
+1. Federated room between servers A, B, and C
+2. Network partition: A can't reach B and C
+3. Users on A continue sending messages
+4. Users on B and C continue conversation
+5. **Two separate event graphs develop**
+6. Network partition heals
+7. Servers try to reconcile but have conflicts
+8. **Server A crashes before full reconciliation**
+9. Admin must merge divergent timelines
+10. Admin extracts events from both forks
+11. **Admin injects events preserving both timelines**
+12. **Expected result:**
+    - Both conversation forks are preserved
+    - Events are ordered by timestamp
+    - State conflicts resolved by auth rules
+    - Federation continues normally
+    - No events are lost from either fork
