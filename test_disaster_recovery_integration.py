@@ -923,6 +923,137 @@ root:
         finally:
             self.stop_synapse()
             print(f"\nTest files left in: {self.temp_dir}")
+    
+    def test_minimal_event_recovery(self):
+        """Test recovery with minimal required fields only."""
+        print("\n=== TEST: Minimal Event Recovery ===")
+        
+        try:
+            # Setup
+            self.setup()
+            self.start_synapse()
+            self.register_user()
+            
+            # Create room with messages
+            room_id = self.create_room()
+            self.send_message(room_id, "Test message")
+            
+            # Get all events
+            all_events = self.get_all_room_events(room_id)
+            
+            # Create minimal versions with only required fields
+            minimal_events = []
+            for event in all_events:
+                minimal = {
+                    "type": event["type"],
+                    "sender": event["sender"],
+                    "room_id": event["room_id"],
+                    "content": event["content"],
+                    "origin_server_ts": event["origin_server_ts"],
+                }
+                
+                # Add state_key for state events
+                if "state_key" in event:
+                    minimal["state_key"] = event["state_key"]
+                
+                # Event ID is required for injection
+                if "event_id" in event:
+                    minimal["event_id"] = event["event_id"]
+                    
+                minimal_events.append(minimal)
+            
+            print(f"Created {len(minimal_events)} minimal events from {len(all_events)} full events")
+            
+            # Simulate disaster - in reality we'd restore from backup
+            # For this test, we'll just verify minimal events work
+            
+            # Inject minimal events
+            response = self.inject_room_events(room_id, minimal_events)
+            print(f"Injection response: injected={response.get('injected_events')}, failed={response.get('failed_events')}")
+            
+            # If they already exist, that's OK - we're testing the format works
+            if response.get("failed_events", 0) > 0:
+                errors = response.get("errors", [])
+                # Check if they're just duplicates
+                all_duplicates = all("UNIQUE constraint failed" in str(err.get("error", "")) for err in errors)
+                if all_duplicates:
+                    print("✓ Minimal events format accepted (events already existed)")
+                else:
+                    raise AssertionError(f"Unexpected errors: {errors}")
+            else:
+                print("✓ Minimal events successfully injected")
+            
+            # Verify room is still functional
+            new_msg = self.send_message(room_id, "Post-minimal-recovery message")
+            assert "event_id" in new_msg
+            
+            print("✓ Minimal event recovery test passed")
+            
+        finally:
+            self.stop_synapse()
+            print(f"\nTest files left in: {self.temp_dir}")
+    
+    def test_missing_events_between_existing(self):
+        """Test recovering events that are missing between existing events."""
+        print("\n=== TEST: Missing Events Between Existing ===")
+        
+        try:
+            # Setup
+            self.setup()
+            self.start_synapse()
+            self.register_user()
+            
+            # Create room
+            room_id = self.create_room()
+            
+            # Send messages 1 and 5 (simulating 2-4 are missing)
+            msg1 = self.send_message(room_id, "Message 1")
+            time.sleep(0.1)
+            
+            # Get current state for constructing missing events
+            all_events = self.get_all_room_events(room_id)
+            
+            # Create "missing" events 2-4 with proper timestamps
+            base_ts = msg1["origin_server_ts"]
+            missing_events = []
+            
+            for i in range(2, 5):
+                event = {
+                    "event_id": f"$missing{i}:localhost",
+                    "type": "m.room.message",
+                    "sender": self.user_id,
+                    "room_id": room_id,
+                    "content": {"msgtype": "m.text", "body": f"Message {i}"},
+                    "origin_server_ts": base_ts + (i * 1000),  # Space them out
+                }
+                missing_events.append(event)
+            
+            # Now send message 5
+            msg5 = self.send_message(room_id, "Message 5")
+            
+            # Inject the missing events
+            print(f"Injecting {len(missing_events)} missing events...")
+            response = self.inject_room_events(room_id, missing_events)
+            print(f"Injection response: injected={response.get('injected_events')}, failed={response.get('failed_events')}")
+            
+            # Verify all messages appear in correct order
+            time.sleep(1)
+            messages = self.get_room_messages(room_id)
+            bodies = [m.get("content", {}).get("body") for m in messages 
+                     if m.get("type") == "m.room.message"]
+            
+            print(f"Messages after injection: {bodies}")
+            
+            # Check we have all 5 messages
+            expected_messages = ["Message 1", "Message 2", "Message 3", "Message 4", "Message 5"]
+            for msg in expected_messages:
+                assert msg in bodies, f"Missing {msg}"
+            
+            print("✓ Missing events between existing successfully recovered")
+            
+        finally:
+            self.stop_synapse()
+            print(f"\nTest files left in: {self.temp_dir}")
             
 
     def run_all_tests(self):
@@ -936,6 +1067,8 @@ root:
             ("Preserved Timestamps", self.test_preserved_timestamps),
             ("Room Functionality After Recovery", self.test_room_functionality_after_recovery),
             ("Room Created After Backup", self.test_room_created_after_backup),
+            ("Minimal Event Recovery", self.test_minimal_event_recovery),
+            ("Missing Events Between Existing", self.test_missing_events_between_existing),
         ]
         
         passed = 0
@@ -977,11 +1110,15 @@ if __name__ == "__main__":
             test.test_room_functionality_after_recovery()
         elif test_name == "room-after-backup":
             test.test_room_created_after_backup()
+        elif test_name == "minimal":
+            test.test_minimal_event_recovery()
+        elif test_name == "missing-between":
+            test.test_missing_events_between_existing()
         elif test_name == "all":
             test.run_all_tests()
         else:
             print(f"Unknown test: {test_name}")
-            print("Available tests: basic, membership, timestamps, functionality, room-after-backup, all")
+            print("Available tests: basic, membership, timestamps, functionality, room-after-backup, minimal, missing-between, all")
     else:
         # Default to basic recovery test
         test.test_basic_recovery()

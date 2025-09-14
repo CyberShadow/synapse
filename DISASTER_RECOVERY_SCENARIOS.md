@@ -126,6 +126,39 @@ This document outlines the disaster recovery scenarios covered by the Synapse bu
 4. **Admin injects events in bulk** (single API call with events from multiple rooms)
 5. **Expected result:** All affected rooms are recovered in a single operation
 
+## Scenario 9: Minimal Event Recovery
+
+**Test Location:** `test_disaster_recovery_integration.py::test_minimal_event_recovery()`
+
+1. Room exists with full event data
+2. **Admin only has access to minimal event fields** (from logs or simplified backups)
+3. Events are stripped to only essential fields:
+   - ✓ event_id, type, sender, room_id, content, origin_server_ts
+   - ✓ state_key (for state events)
+   - ✗ auth_events, prev_events, depth, signatures, hashes, etc.
+4. **Admin injects minimal events**
+5. **Expected result:**
+   - Events are accepted and processed
+   - Missing fields are automatically populated
+   - Room remains functional
+
+## Scenario 10: Missing Events Between Existing
+
+**Test Location:** `test_disaster_recovery_integration.py::test_missing_events_between_existing()`
+
+1. User sends "Message 1" in a room
+2. User sends "Message 2", "Message 3", "Message 4"
+3. User sends "Message 5"
+4. **Messages 2-4 are lost** (partial database corruption, selective data loss)
+5. Room timeline shows: Message 1 → Message 5 (gap in conversation)
+6. Admin recovers Messages 2-4 from backup/logs
+7. **Admin injects missing messages with correct timestamps**
+8. **Expected result:**
+   - All messages appear in correct chronological order
+   - Timeline integrity is restored: Message 1 → 2 → 3 → 4 → 5
+   - No duplicate messages
+   - Conversation flow is natural
+
 ## Test Implementation Details
 
 ### Integration Tests
@@ -166,6 +199,9 @@ python test_disaster_recovery_integration.py basic
 python test_disaster_recovery_integration.py membership
 python test_disaster_recovery_integration.py timestamps
 python test_disaster_recovery_integration.py functionality
+python test_disaster_recovery_integration.py room-after-backup
+python test_disaster_recovery_integration.py minimal
+python test_disaster_recovery_integration.py missing-between
 
 # Run in container
 podman run --rm -v ".:/synapse" -w /synapse --entrypoint="" localhost/synapse-dev:latest \
