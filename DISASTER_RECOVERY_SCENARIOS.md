@@ -12,9 +12,11 @@ This document outlines the disaster recovery scenarios covered by the Synapse bu
 4. User sends "Message 3"
 5. User sends "Message 4"
 6. **Server crashes and database is restored from backup** (loses Messages 3 & 4)
-7. Admin extracts Messages 3 & 4 from external source (logs, federation, etc.)
-8. Admin removes auth_events/prev_events/depth to simulate federation recovery
-9. **Admin injects Messages 3 & 4 via bulk injection API**
+7. Admin extracts Messages 3 & 4 from external source:
+   - From federation: Events arrive without internal fields (auth_events/prev_events/depth)
+   - From logs: May only have basic event data
+   - From backups: May have complete data
+8. **Admin injects Messages 3 & 4 via bulk injection API** (fields are auto-populated if missing)
 10. **Expected result:** All 4 messages are visible in correct order, room remains functional
 
 ## Scenario 2: User Membership Recovery
@@ -40,9 +42,14 @@ This document outlines the disaster recovery scenarios covered by the Synapse bu
 2. **Server database is backed up**
 3. More messages are sent
 4. **Server crashes and database is restored from backup**
-5. Admin receives events from federation (missing auth_events, prev_events, depth)
-6. **Admin injects events with only basic fields** (event_id, type, sender, room_id, content, origin_server_ts)
-7. **Expected result:** 
+5. Admin requests missing events from federation partners
+6. **Federation servers provide events but only with basic fields:**
+   - ✓ event_id, type, sender, room_id, content, origin_server_ts
+   - ✗ auth_events (internal field, not sent over federation)
+   - ✗ prev_events (internal field, not sent over federation)
+   - ✗ depth (internal field, not sent over federation)
+7. **Admin injects events as received from federation**
+8. **Expected result:** 
    - auth_events are automatically reconstructed based on room state
    - prev_events are set to current room forward extremities
    - depth is calculated from prev_events
