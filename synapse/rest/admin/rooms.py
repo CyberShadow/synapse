@@ -1106,6 +1106,8 @@ class BulkEventInjectionServlet(RestServlet):
             if room_id not in events_by_room:
                 events_by_room[room_id] = []
             events_by_room[room_id].append(event_dict)
+        
+        logger.info(f"Processing {len(events_data)} events across {len(events_by_room)} rooms")
 
         total_injected = 0
         total_failed = 0
@@ -1266,25 +1268,76 @@ class BulkEventInjectionServlet(RestServlet):
                 ):
                     event_dict["prev_events"] = []
                     
+                # For room v3+, auth_events and prev_events might be provided as tuples
+                # Convert them to simple lists for processing
+                if event_dict.get("auth_events") and len(event_dict["auth_events"]) > 0:
+                    if isinstance(event_dict["auth_events"][0], (list, tuple)):
+                        logger.debug(f"Converting auth_events from tuples to list for event {event_dict.get('event_id')}")
+                        event_dict["auth_events"] = [auth[0] if isinstance(auth, (list, tuple)) else auth 
+                                                     for auth in event_dict["auth_events"]]
+                
+                if event_dict.get("prev_events") and len(event_dict["prev_events"]) > 0:
+                    if isinstance(event_dict["prev_events"][0], (list, tuple)):
+                        logger.debug(f"Converting prev_events from tuples to list for event {event_dict.get('event_id')}")
+                        event_dict["prev_events"] = [prev[0] if isinstance(prev, (list, tuple)) else prev 
+                                                     for prev in event_dict["prev_events"]]
+                    
                 # Auto-populate auth_events if not provided (for federation recovery)
                 if not event_dict.get("auth_events"):
-                    event_dict["auth_events"] = await self._get_required_auth_event_ids(
-                        room_id,
-                        event_dict["type"],
-                        event_dict.get("state_key"),
-                        event_dict["sender"]
-                    )
+                    logger.debug(f"Auto-populating auth_events for event {event_dict.get('event_id')}")
+                    try:
+                        event_dict["auth_events"] = await self._get_required_auth_event_ids(
+                            room_id,
+                            event_dict["type"],
+                            event_dict.get("state_key"),
+                            event_dict["sender"]
+                        )
+                        logger.debug(f"Auto-populated auth_events: {event_dict['auth_events']}")
+                    except Exception as e:
+                        logger.warning(f"Failed to auto-populate auth_events: {e}")
+                        event_dict["auth_events"] = []
+                
+                # Auto-populate prev_events if not provided (for federation recovery)
+                if not event_dict.get("prev_events"):
+                    logger.debug(f"Auto-populating prev_events for event {event_dict.get('event_id')}")
+                    try:
+                        prev_event_ids = await self._get_prev_event_ids_for_room(room_id)
+                        if prev_event_ids:
+                            # For room v3+, prev_events should be formatted as tuples
+                            if room_version.event_format >= 3:
+                                event_dict["prev_events"] = [(event_id, {}) for event_id in prev_event_ids]
+                            else:
+                                event_dict["prev_events"] = prev_event_ids
+                            logger.debug(f"Auto-populated prev_events: {event_dict['prev_events']}")
+                        else:
+                            logger.debug("No forward extremities found, using empty prev_events")
+                            event_dict["prev_events"] = []
+                    except Exception as e:
+                        logger.warning(f"Failed to auto-populate prev_events: {e}")
+                        event_dict["prev_events"] = []
 
                 # Auto-calculate depth if not provided, based on prev_events
                 if "depth" not in event_dict:
                     prev_event_ids = event_dict.get("prev_events", [])
+                    # Handle both list of IDs and list of tuples (room v3+)
+                    if prev_event_ids and isinstance(prev_event_ids[0], tuple):
+                        prev_event_ids = [event_id for event_id, _ in prev_event_ids]
+                    
                     if prev_event_ids:
-                        # Get max depth of prev events and add 1
-                        max_depth = await self._store.get_max_depth_of(prev_event_ids)
-                        event_dict["depth"] = max_depth[1] + 1 if max_depth[1] is not None else 1
+                        try:
+                            # Get max depth of prev events and add 1
+                            logger.debug(f"Getting max depth for prev_event_ids: {prev_event_ids} (type: {type(prev_event_ids)})")
+                            max_depth = await self._store.get_max_depth_of(prev_event_ids)
+                            event_dict["depth"] = max_depth[1] + 1 if max_depth[1] is not None else 1
+                            logger.debug(f"Auto-calculated depth: {event_dict['depth']} based on prev_events")
+                        except Exception as e:
+                            logger.warning(f"Failed to calculate depth from prev_events: {type(e).__name__}: {e}")
+                            logger.warning(f"prev_event_ids was: {prev_event_ids}")
+                            event_dict["depth"] = 1
                     else:
                         # No prev events, start with depth 1
                         event_dict["depth"] = 1
+                        logger.debug("No prev_events, using default depth 1")
 
                 # Create EventBase object
                 provided_event_id = event_dict.get("event_id")
@@ -1294,12 +1347,24 @@ class BulkEventInjectionServlet(RestServlet):
                 if room_version.event_format >= 3:  # Room v3+
                     event_dict.pop("event_id", None)  # Remove provided event_id
                 
+                # Debug logging before creating event
+                logger.debug(f"Creating event from dict: type={event_dict.get('type')}, "
+                           f"state_key={event_dict.get('state_key')}, "
+                           f"room_version={room_version.identifier}")
+                logger.debug(f"Event dict auth_events type: {type(event_dict.get('auth_events'))}, "
+                           f"value: {event_dict.get('auth_events')}")
+                logger.debug(f"Event dict prev_events type: {type(event_dict.get('prev_events'))}, "
+                           f"value: {event_dict.get('prev_events')}")
+                
                 # Create the event with proper room version
                 event = make_event_from_dict(event_dict, room_version)
                 reconstructed_events.append(event)
                 
                 # Track the mapping for response
                 event_id_mapping[provided_event_id] = event.event_id
+                
+                logger.debug(f"Successfully created event: {event.event_id} "
+                           f"(original: {provided_event_id})")
 
             except Exception as e:
                 logger.exception(
@@ -1440,7 +1505,14 @@ class BulkEventInjectionServlet(RestServlet):
                 )
                 
                 # Insert auth events
-                for auth_id in event.auth_event_ids():
+                auth_event_ids = event.auth_event_ids()
+                logger.debug(f"Inserting auth events for {event.event_id}: {auth_event_ids}")
+                for auth_id in auth_event_ids:
+                    # Ensure auth_id is a string, not a tuple
+                    if isinstance(auth_id, tuple):
+                        logger.warning(f"Auth event ID is a tuple: {auth_id}, extracting first element")
+                        auth_id = auth_id[0]
+                    
                     self._store.db_pool.simple_insert_txn(
                         txn,
                         table="event_auth",
@@ -1452,7 +1524,14 @@ class BulkEventInjectionServlet(RestServlet):
                     )
                 
                 # Insert prev events
-                for prev_id in event.prev_event_ids():
+                prev_event_ids = event.prev_event_ids()
+                logger.debug(f"Inserting prev events for {event.event_id}: {prev_event_ids}")
+                for prev_id in prev_event_ids:
+                    # Ensure prev_id is a string, not a tuple
+                    if isinstance(prev_id, tuple):
+                        logger.warning(f"Prev event ID is a tuple: {prev_id}, extracting first element")
+                        prev_id = prev_id[0]
+                    
                     self._store.db_pool.simple_insert_txn(
                         txn,
                         table="event_edges",
@@ -1576,10 +1655,18 @@ class BulkEventInjectionServlet(RestServlet):
             
             return event_stream_orderings
         
-        event_stream_orderings = await self._store.db_pool.runInteraction(
-            "disaster_recovery_insert_events",
-            _insert_events_txn
-        )
+        try:
+            event_stream_orderings = await self._store.db_pool.runInteraction(
+                "disaster_recovery_insert_events",
+                _insert_events_txn
+            )
+        except Exception as e:
+            logger.error(f"Database insertion failed: {type(e).__name__}: {e}")
+            # Check if it's the tuple error
+            if "type 'tuple' is not supported" in str(e):
+                logger.error("SQL tuple error detected - likely caused by tuples in event IDs")
+                logger.error("This usually happens when room v3+ tuple format leaks into SQL parameters")
+            raise
         
         # Clear caches - these might not have invalidate_all() method
         # TODO: Find proper way to invalidate these caches
@@ -1706,8 +1793,13 @@ class BulkEventInjectionServlet(RestServlet):
         """
         auth_event_ids = []
         
-        # Get current state IDs
-        state_ids = await self._store.get_current_state_ids(room_id)
+        try:
+            # Get current state IDs using the storage controller
+            state_ids = await self._storage_controllers.state.get_current_state_ids(room_id)
+        except Exception as e:
+            logger.warning(f"Failed to get current state IDs for room {room_id}: {e}")
+            # Return empty list if we can't get state
+            return auth_event_ids
         
         # Always need the create event
         create_event_id = state_ids.get((EventTypes.Create, ""))
@@ -1742,6 +1834,40 @@ class BulkEventInjectionServlet(RestServlet):
                 auth_event_ids.append(prev_state_id)
                 
         return auth_event_ids
+    
+    async def _get_prev_event_ids_for_room(self, room_id: str) -> List[str]:
+        """Get the appropriate prev_event IDs for a room.
+        
+        For federation recovery, we need to get the current forward extremities
+        which represent the "tips" of the event DAG in the room.
+        
+        Args:
+            room_id: The room ID
+            
+        Returns:
+            List of event IDs to use as prev_events
+        """
+        try:
+            # Get forward extremities - these return tuples of (event_id, state_group)
+            extremities = await self._store.get_forward_extremities_for_room(room_id)
+            
+            if not extremities:
+                logger.warning(f"No forward extremities found for room {room_id}")
+                return []
+            
+            # Extract just the event IDs from the tuples
+            prev_event_ids = [extremity[0] for extremity in extremities]
+            
+            logger.debug(f"Found {len(prev_event_ids)} forward extremities for room {room_id}")
+            
+            # For room v3+, we need to format prev_events as tuples with event_id and {}
+            # But at this stage, we're just returning the event IDs
+            # The formatting will be done when constructing the event dict
+            return prev_event_ids
+            
+        except Exception as e:
+            logger.warning(f"Failed to get forward extremities for room {room_id}: {e}")
+            return []
     
     async def _fix_room_state_after_bulk_injection(self, room_id: str) -> None:
         """Fix room state after bulk injection completes.

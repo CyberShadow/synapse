@@ -275,7 +275,10 @@ root:
             "POST",
             f"http://localhost:{self.port}/_matrix/client/r0/createRoom",
             headers={"Authorization": f"Bearer {self.access_token}"},
-            data={"name": "Test Room"}
+            data={
+                "name": "Test Room",
+                "room_version": "10"  # Use modern room version
+            }
         )
         
         room_id = response["room_id"]
@@ -446,34 +449,15 @@ root:
             # 10. Use bulk injection to restore lost messages
             print("\n--- RESTORING LOST MESSAGES ---")
             
-            # Add required fields for bulk injection
-            # Get auth events from room state
-            state_events = [e for e in all_events if e.get("state_key") is not None]
-            create_event_id = None
-            member_event_id = None
-            power_event_id = None
-            
-            for event in state_events:
-                if event["type"] == "m.room.create":
-                    create_event_id = event["event_id"]
-                elif event["type"] == "m.room.member" and event["state_key"] == self.user_id:
-                    member_event_id = event["event_id"]
-                elif event["type"] == "m.room.power_levels":
-                    power_event_id = event["event_id"]
-                    
-            # Add required fields to events
+            # For federation recovery simulation, remove auth_events and prev_events
+            # The bulk injection API will automatically reconstruct them
+            print("\nSimulating federation recovery - removing auth_events and prev_events...")
             for event in messages_to_recover:
-                event["auth_events"] = []
-                if create_event_id:
-                    event["auth_events"].append(create_event_id)
-                if member_event_id:
-                    event["auth_events"].append(member_event_id)
-                if power_event_id:
-                    event["auth_events"].append(power_event_id)
-                    
-                # For prev_events, use the last message before this one
-                event["prev_events"] = [msg2]  # Message 2's event ID
-                event["depth"] = 10  # Reasonable depth
+                # Remove fields that would be missing in federation recovery
+                event.pop("auth_events", None)
+                event.pop("prev_events", None)
+                event.pop("depth", None)
+                print(f"  Event {event['event_id']} stripped to basic fields")
             
             response = self.inject_room_events(room_id, messages_to_recover)
             print(f"\nInjection response: {response}")
