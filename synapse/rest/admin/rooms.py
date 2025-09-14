@@ -1265,6 +1265,15 @@ class BulkEventInjectionServlet(RestServlet):
                     event_dict["prev_events"], list
                 ):
                     event_dict["prev_events"] = []
+                    
+                # Auto-populate auth_events if not provided (for federation recovery)
+                if not event_dict.get("auth_events"):
+                    event_dict["auth_events"] = await self._get_required_auth_event_ids(
+                        room_id,
+                        event_dict["type"],
+                        event_dict.get("state_key"),
+                        event_dict["sender"]
+                    )
 
                 # Auto-calculate depth if not provided, based on prev_events
                 if "depth" not in event_dict:
@@ -1335,26 +1344,25 @@ class BulkEventInjectionServlet(RestServlet):
                 room_id,
             )
 
-            # For rooms created entirely from bulk injection, ensure membership state
-            # This must be done after persistence completes
-            has_create = any(e.type == EventTypes.Create for e in reconstructed_events)
-            print(f"DEBUG BulkEventInjection: Checking if room needs membership fix: has_create={has_create} for room {room_id}")
-            print(f"DEBUG BulkEventInjection: Event types: {[e.type for e in reconstructed_events]}")
-            if has_create:
-                print(f"DEBUG BulkEventInjection: Calling _fix_room_membership_after_bulk_injection for room {room_id}")
-                await self._fix_room_membership_after_bulk_injection(room_id)
+            # For all bulk injections, ensure room state is properly set up
+            # This is critical for rooms to remain functional after injection
+            print(f"DEBUG BulkEventInjection: Event types injected: {[e.type for e in reconstructed_events]}")
+            print(f"DEBUG BulkEventInjection: Ensuring room state is properly set up for room {room_id}")
+            await self._fix_room_state_after_bulk_injection(room_id)
             
             return injected_count, failed_count, errors, event_id_mapping
 
         except Exception as e:
             logger.exception("Failed to persist events for disaster recovery")
-            error_msg = f"Event persistence failed: {type(e).__name__}: {str(e)}"
+            import traceback
+            error_msg = f"Event persistence failed: {type(e).__name__}: {str(e)}\nTraceback: {traceback.format_exc()}"
+            print(f"DEBUG: Full error: {error_msg}")
             # If persistence fails, all events failed
             for event in reconstructed_events:
                 errors.append(
                     {
                         "event_id": event.event_id,
-                        "error": error_msg,
+                        "error": f"Event persistence failed: {type(e).__name__}: {str(e)}",
                     }
                 )
             return 0, len(events_data), errors, event_id_mapping
@@ -1390,10 +1398,12 @@ class BulkEventInjectionServlet(RestServlet):
             # Get next stream ordering
             stream_gen = self._store._stream_id_gen
             stream_orderings = []
+            event_stream_orderings = {}  # Map event_id to stream_ordering
             
             for event in events:
                 stream_ordering = stream_gen.get_next_txn(txn)
                 stream_orderings.append(stream_ordering)
+                event_stream_orderings[event.event_id] = stream_ordering
                 
                 # Insert into events table
                 self._store.db_pool.simple_insert_txn(
@@ -1563,8 +1573,10 @@ class BulkEventInjectionServlet(RestServlet):
                         "room_id": room_id,
                     },
                 )
+            
+            return event_stream_orderings
         
-        await self._store.db_pool.runInteraction(
+        event_stream_orderings = await self._store.db_pool.runInteraction(
             "disaster_recovery_insert_events",
             _insert_events_txn
         )
@@ -1575,6 +1587,33 @@ class BulkEventInjectionServlet(RestServlet):
         # self._store.get_rooms_for_local_user_where_membership_is.invalidate_all()
         
         print(f"DEBUG _persist_events: Direct insertion complete for {len(events)} events")
+        
+        # Notify about new events so they appear in /sync
+        # This is critical for events to appear in client APIs
+        if event_stream_orderings:
+            notifier = self._hs.get_notifier()
+            
+            # Create proper stream tokens for notification
+            from synapse.types import PersistedEventPosition, RoomStreamToken
+            
+            events_and_pos = []
+            max_stream_ordering = 0
+            
+            for event in events:
+                # Get the stream ordering we stored
+                stream_ordering = event_stream_orderings.get(event.event_id)
+                if stream_ordering:
+                    pos = PersistedEventPosition("master", stream_ordering)
+                    events_and_pos.append((event, pos))
+                    max_stream_ordering = max(max_stream_ordering, stream_ordering)
+                    
+            if events_and_pos:
+                # Create room stream token for the latest event
+                room_stream_token = RoomStreamToken(stream=max_stream_ordering)
+                await notifier.on_new_room_events(
+                    events_and_pos,
+                    room_stream_token,
+                )
 
     async def _attempt_de_outliering_simple(self, events: List[EventBase]) -> None:
         """Simple de-outliering attempt for non-backfilled events.
@@ -1648,21 +1687,80 @@ class BulkEventInjectionServlet(RestServlet):
                 )
                 continue
 
-    async def _fix_room_membership_after_bulk_injection(self, room_id: str) -> None:
-        """Fix room membership state after bulk injection completes.
+    async def _get_required_auth_event_ids(
+        self, room_id: str, event_type: str, state_key: Optional[str], sender: str
+    ) -> List[str]:
+        """Get the minimal set of auth event IDs required for an event.
         
-        This ensures that membership tracking tables are properly populated
-        for rooms created entirely via bulk injection, so users can access
-        the room.
+        This is used when recovering events from federation where we don't have
+        the original auth_events list.
+        
+        Args:
+            room_id: The room ID
+            event_type: The type of event being authorized
+            state_key: The state key if this is a state event
+            sender: The sender of the event
+            
+        Returns:
+            List of event IDs that should be used as auth_events
+        """
+        auth_event_ids = []
+        
+        # Get current state IDs
+        state_ids = await self._store.get_current_state_ids(room_id)
+        
+        # Always need the create event
+        create_event_id = state_ids.get((EventTypes.Create, ""))
+        if create_event_id:
+            auth_event_ids.append(create_event_id)
+            
+        # Always need the sender's membership
+        sender_member_id = state_ids.get((EventTypes.Member, sender))
+        if sender_member_id:
+            auth_event_ids.append(sender_member_id)
+            
+        # Always need power levels
+        power_levels_id = state_ids.get((EventTypes.PowerLevels, ""))
+        if power_levels_id:
+            auth_event_ids.append(power_levels_id)
+            
+        # For join rules, need the join rules event
+        if event_type == EventTypes.Member and state_key != sender:
+            join_rules_id = state_ids.get((EventTypes.JoinRules, ""))
+            if join_rules_id:
+                auth_event_ids.append(join_rules_id)
+                
+        # For invites, might need third party invite
+        if event_type == EventTypes.Member:
+            # Could add third party invite logic here if needed
+            pass
+            
+        # For state events, might need the previous state
+        if state_key is not None and (event_type, state_key) in state_ids:
+            prev_state_id = state_ids.get((event_type, state_key))
+            if prev_state_id and prev_state_id not in auth_event_ids:
+                auth_event_ids.append(prev_state_id)
+                
+        return auth_event_ids
+    
+    async def _fix_room_state_after_bulk_injection(self, room_id: str) -> None:
+        """Fix room state after bulk injection completes.
+        
+        This ensures that all state tables are properly populated after bulk injection,
+        including current_state_events, state_groups_state, and membership tables.
+        This is critical for rooms to remain functional after disaster recovery.
         
         Args:
             room_id: The room ID to fix
         """
-        print(f"DEBUG _fix_room_membership: Called for room {room_id}")
+        print(f"DEBUG _fix_room_state: Called for room {room_id}")
         
         # First, ensure we have proper current state for the room
-        # This is critical for rooms created entirely from bulk injection
+        # This is critical for rooms to remain functional
         await self._ensure_room_has_current_state(room_id)
+        
+        # Then fix state groups to ensure they have proper state mappings
+        await self._ensure_state_groups_populated(room_id)
         
         
         def _fix_membership_tables(txn):
@@ -1835,7 +1933,85 @@ class BulkEventInjectionServlet(RestServlet):
             )
             
         logger.info("Populated %d current state events for room %s", len(latest_state), room_id)
+    
+    async def _ensure_state_groups_populated(self, room_id: str) -> None:
+        """Ensure state_groups_state table is properly populated for a room.
         
+        This is critical for event auth to work - when creating new events,
+        Synapse needs to look up the current state from state groups.
+        """
+        # Get the latest state group for the room
+        # We need to get the max state group ID since there might be multiple
+        def get_latest_state_group(txn):
+            txn.execute(
+                "SELECT MAX(id) FROM state_groups WHERE room_id = ?",
+                (room_id,)
+            )
+            row = txn.fetchone()
+            return row[0] if row and row[0] is not None else None
+            
+        state_group_id = await self._store.db_pool.runInteraction(
+            "get_latest_state_group",
+            get_latest_state_group
+        )
+        
+        if not state_group_id:
+            logger.warning("No state group found for room %s", room_id)
+            return
+            
+        # Check if state_groups_state is populated for this state group
+        existing_state = await self._store.db_pool.simple_select_list(
+            table="state_groups_state",
+            keyvalues={"state_group": state_group_id},
+            retcols=["type", "state_key", "event_id"],
+            desc="check_state_group_state",
+        )
+        
+        if existing_state:
+            logger.info("State group %d already has %d state entries", state_group_id, len(existing_state))
+            return
+            
+        logger.info("Populating state_groups_state for state group %d in room %s", state_group_id, room_id)
+        
+        # Get current state events manually since simple_select_list returns tuples
+        def get_current_state(txn):
+            txn.execute("""
+                SELECT type, state_key, event_id
+                FROM current_state_events
+                WHERE room_id = ?
+            """, (room_id,))
+            return txn.fetchall()
+            
+        current_state_rows = await self._store.db_pool.runInteraction(
+            "get_current_state_for_state_group",
+            get_current_state
+        )
+        
+        if not current_state_rows:
+            logger.warning("No current state events found for room %s", room_id)
+            return
+            
+        # Populate state_groups_state
+        def _populate_state_groups_state(txn):
+            for event_type, state_key, event_id in current_state_rows:
+                self._store.db_pool.simple_insert_txn(
+                    txn,
+                    table="state_groups_state",
+                    values={
+                        "state_group": state_group_id,
+                        "room_id": room_id,
+                        "type": event_type,
+                        "state_key": state_key,
+                        "event_id": event_id,
+                    },
+                )
+                
+        await self._store.db_pool.runInteraction(
+            "populate_state_groups_state",
+            _populate_state_groups_state,
+        )
+        
+        logger.info("Populated %d state entries in state_groups_state for room %s", len(current_state_rows), room_id)
 
     async def _ensure_auth_events_available(self, events: List[EventBase]) -> None:
         """Ensure all required auth events are available locally before processing.
