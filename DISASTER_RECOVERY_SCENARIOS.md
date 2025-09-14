@@ -326,7 +326,7 @@ podman run --rm -v ".:/synapse" -w /synapse --entrypoint="" localhost/synapse-de
 
 ## Scenario 17: Invite-Only Room Access Loss
 
-**Test Location:** `test_disaster_recovery_integration.py::test_invite_only_recovery()` (to be implemented)
+**Test Location:** `test_disaster_recovery_integration.py::test_invite_only_room_access_loss()`
 
 1. Alice creates private invite-only room
 2. Alice invites Bob and Charlie via direct invites

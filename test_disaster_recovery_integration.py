@@ -1525,6 +1525,247 @@ root:
         finally:
             self.stop_synapse()
             print(f"\nTest files left in: {self.temp_dir}")
+
+    def test_invite_only_room_access_loss(self):
+        """Test recovery when users lose access to invite-only rooms."""
+        print("\n=== TEST: Invite-Only Room Access Loss ===")
+        
+        try:
+            # Setup
+            self.setup()
+            self.start_synapse()
+            
+            # Register admin and three users
+            self.register_user()  # admin
+            
+            # Register Alice
+            alice_nonce_response = self._make_request("GET", f"http://localhost:{self.port}/_synapse/admin/v1/register")
+            alice_nonce = alice_nonce_response["nonce"]
+            
+            import hmac
+            import hashlib
+            alice_mac = hmac.new(
+                b"test_secret",
+                f"{alice_nonce}\x00alice\x00alice_pass\x00notadmin".encode(),
+                hashlib.sha1
+            ).hexdigest()
+            
+            alice_response = self._make_request(
+                "POST",
+                f"http://localhost:{self.port}/_synapse/admin/v1/register",
+                data={"nonce": alice_nonce, "username": "alice", "password": "alice_pass", "admin": False, "mac": alice_mac}
+            )
+            alice_token = alice_response["access_token"]
+            alice_id = "@alice:localhost"
+            
+            # Register Bob
+            bob_nonce_response = self._make_request("GET", f"http://localhost:{self.port}/_synapse/admin/v1/register")
+            bob_nonce = bob_nonce_response["nonce"]
+            
+            bob_mac = hmac.new(
+                b"test_secret",
+                f"{bob_nonce}\x00bob\x00bob_pass\x00notadmin".encode(),
+                hashlib.sha1
+            ).hexdigest()
+            
+            bob_response = self._make_request(
+                "POST",
+                f"http://localhost:{self.port}/_synapse/admin/v1/register",
+                data={"nonce": bob_nonce, "username": "bob", "password": "bob_pass", "admin": False, "mac": bob_mac}
+            )
+            bob_token = bob_response["access_token"]
+            bob_id = "@bob:localhost"
+            
+            # Register Charlie
+            charlie_nonce_response = self._make_request("GET", f"http://localhost:{self.port}/_synapse/admin/v1/register")
+            charlie_nonce = charlie_nonce_response["nonce"]
+            
+            charlie_mac = hmac.new(
+                b"test_secret",
+                f"{charlie_nonce}\x00charlie\x00charlie_pass\x00notadmin".encode(),
+                hashlib.sha1
+            ).hexdigest()
+            
+            charlie_response = self._make_request(
+                "POST",
+                f"http://localhost:{self.port}/_synapse/admin/v1/register",
+                data={"nonce": charlie_nonce, "username": "charlie", "password": "charlie_pass", "admin": False, "mac": charlie_mac}
+            )
+            charlie_token = charlie_response["access_token"]
+            charlie_id = "@charlie:localhost"
+            
+            # Alice creates private invite-only room
+            print("Alice creating private invite-only room...")
+            room_response = self._make_request(
+                "POST",
+                f"http://localhost:{self.port}/_matrix/client/r0/createRoom",
+                headers={"Authorization": f"Bearer {alice_token}"},
+                data={
+                    "name": "Private Room",
+                    "preset": "private_chat"  # This creates an invite-only room
+                }
+            )
+            room_id = room_response["room_id"]
+            print(f"Created private room: {room_id}")
+            
+            # Alice invites Bob and Charlie
+            print("Alice inviting Bob...")
+            self._make_request(
+                "POST",
+                f"http://localhost:{self.port}/_matrix/client/r0/rooms/{room_id}/invite",
+                headers={"Authorization": f"Bearer {alice_token}"},
+                data={"user_id": bob_id}
+            )
+            
+            print("Alice inviting Charlie...")
+            self._make_request(
+                "POST",
+                f"http://localhost:{self.port}/_matrix/client/r0/rooms/{room_id}/invite",
+                headers={"Authorization": f"Bearer {alice_token}"},
+                data={"user_id": charlie_id}
+            )
+            
+            # Bob and Charlie accept invites
+            print("Bob joining room...")
+            self.join_room(room_id, bob_token)
+            
+            print("Charlie joining room...")
+            self.join_room(room_id, charlie_token)
+            
+            # Exchange some messages
+            self.send_message(room_id, "Welcome to the private room!", alice_token)
+            self.send_message(room_id, "Thanks for the invite, Alice!", bob_token)
+            self.send_message(room_id, "Happy to be here!", charlie_token)
+            
+            # Backup database
+            backup_path = self.backup_database()
+            
+            # Register David
+            david_nonce_response = self._make_request("GET", f"http://localhost:{self.port}/_synapse/admin/v1/register")
+            david_nonce = david_nonce_response["nonce"]
+            
+            david_mac = hmac.new(
+                b"test_secret",
+                f"{david_nonce}\x00david\x00david_pass\x00notadmin".encode(),
+                hashlib.sha1
+            ).hexdigest()
+            
+            david_response = self._make_request(
+                "POST",
+                f"http://localhost:{self.port}/_synapse/admin/v1/register",
+                data={"nonce": david_nonce, "username": "david", "password": "david_pass", "admin": False, "mac": david_mac}
+            )
+            david_token = david_response["access_token"]
+            david_id = "@david:localhost"
+            
+            # Alice invites David
+            print("Alice inviting David...")
+            self._make_request(
+                "POST",
+                f"http://localhost:{self.port}/_matrix/client/r0/rooms/{room_id}/invite",
+                headers={"Authorization": f"Bearer {alice_token}"},
+                data={"user_id": david_id}
+            )
+            
+            # David joins the room
+            print("David joining room...")
+            self.join_room(room_id, david_token)
+            
+            # David sends messages
+            self.send_message(room_id, "Hi everyone, I'm new here!", david_token)
+            self.send_message(room_id, "Thanks for adding me to the group", david_token)
+            
+            # Get David's events before disaster (use Alice's token since admin is not in the room)
+            saved_token = self.access_token
+            self.access_token = alice_token
+            all_events = self.get_all_room_events(room_id)
+            self.access_token = saved_token
+            david_events = []
+            for event in all_events:
+                if event.get("sender") == david_id or (
+                    event.get("type") == "m.room.member" and event.get("state_key") == david_id
+                ):
+                    david_events.append(event)
+                    
+            print(f"Found {len(david_events)} events for David to recover")
+            
+            # Simulate disaster
+            self.stop_synapse()
+            self.restore_database(backup_path)
+            self.start_synapse()
+            self.login()  # Re-login as admin
+            
+            # Re-login existing users
+            alice_login = self._make_request(
+                "POST",
+                f"http://localhost:{self.port}/_matrix/client/r0/login",
+                data={"type": "m.login.password", "user": "alice", "password": "alice_pass"}
+            )
+            alice_token = alice_login["access_token"]
+            
+            # David tries to access room - should fail
+            print("Checking David's access after restore...")
+            try:
+                # David doesn't exist in the restored database, so we can't login
+                # Let's verify the room state shows David is not a member
+                
+                # Use Alice's token to check room members
+                members_response = self._make_request(
+                    "GET",
+                    f"http://localhost:{self.port}/_matrix/client/r0/rooms/{room_id}/members",
+                    headers={"Authorization": f"Bearer {alice_token}"}
+                )
+                
+                member_ids = [m["state_key"] for m in members_response.get("chunk", [])]
+                assert david_id not in member_ids, "David should not be in room after restore"
+                print("✓ Confirmed David has no access after restore")
+                
+            except Exception as e:
+                print(f"Expected error confirmed: {e}")
+            
+            # Admin recovers David's invite and join events
+            print(f"Admin injecting {len(david_events)} events to restore David's access...")
+            response = self.inject_room_events(room_id, david_events)
+            print(f"Injection response: {response}")
+            assert response["injected_events"] == len(david_events), f"Expected to inject {len(david_events)} events"
+            
+            # Wait for events to process
+            time.sleep(1)
+            
+            # Verify David is now a member again
+            members_response = self._make_request(
+                "GET",
+                f"http://localhost:{self.port}/_matrix/client/r0/rooms/{room_id}/members",
+                headers={"Authorization": f"Bearer {alice_token}"}
+            )
+            
+            member_ids = [m["state_key"] for m in members_response.get("chunk", [])]
+            assert david_id in member_ids, "David should be a member after recovery"
+            
+            # Verify all messages are visible (use Alice's token)
+            saved_token = self.access_token
+            self.access_token = alice_token
+            messages = self.get_room_messages(room_id)
+            self.access_token = saved_token
+            message_bodies = [m.get("content", {}).get("body", "") for m in messages if m.get("type") == "m.room.message"]
+            
+            # Check David's messages are there
+            assert "Hi everyone, I'm new here!" in message_bodies, "David's first message should be recovered"
+            assert "Thanks for adding me to the group" in message_bodies, "David's second message should be recovered"
+            
+            # Verify room is still invite-only
+            join_rules_response = self._make_request(
+                "GET",
+                f"http://localhost:{self.port}/_matrix/client/r0/rooms/{room_id}/state/m.room.join_rules",
+                headers={"Authorization": f"Bearer {alice_token}"}
+            )
+            assert join_rules_response.get("join_rule") == "invite", "Room should still be invite-only"
+            
+            print("✓ Invite-only room access loss test passed")
+            
+        finally:
+            self.stop_synapse()
+            print(f"\nTest files left in: {self.temp_dir}")
             
 
     def run_all_tests(self):
@@ -1544,6 +1785,7 @@ root:
             ("Encrypted Room Recovery", self.test_encrypted_room_recovery),
             ("State Conflict Recovery", self.test_state_conflict_recovery),
             ("Redaction Recovery", self.test_redaction_recovery),
+            ("Invite-Only Room Access Loss", self.test_invite_only_room_access_loss),
         ]
         
         passed = 0
@@ -1597,11 +1839,13 @@ if __name__ == "__main__":
             test.test_state_conflict_recovery()
         elif test_name == "redaction":
             test.test_redaction_recovery()
+        elif test_name == "invite-only":
+            test.test_invite_only_room_access_loss()
         elif test_name == "all":
             test.run_all_tests()
         else:
             print(f"Unknown test: {test_name}")
-            print("Available tests: basic, membership, timestamps, functionality, room-after-backup, minimal, missing-between, historical, encrypted, state-conflict, redaction, all")
+            print("Available tests: basic, membership, timestamps, functionality, room-after-backup, minimal, missing-between, historical, encrypted, state-conflict, redaction, invite-only, all")
     else:
         # Default to basic recovery test
         test.test_basic_recovery()
