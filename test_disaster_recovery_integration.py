@@ -1054,6 +1054,71 @@ root:
         finally:
             self.stop_synapse()
             print(f"\nTest files left in: {self.temp_dir}")
+    
+    def test_historical_events_pagination(self):
+        """Test that events with very old timestamps are accessible via pagination."""
+        print("\n=== TEST: Historical Events Pagination ===")
+        
+        try:
+            # Setup
+            self.setup()
+            self.start_synapse()
+            self.register_user()
+            
+            # Create room
+            room_id = self.create_room()
+            
+            # Send a current message
+            current_msg = self.send_message(room_id, "Current message")
+            current_ts = current_msg["origin_server_ts"]
+            
+            # Create historical events (e.g., from 30 days ago)
+            historical_events = []
+            thirty_days_ago = current_ts - (30 * 24 * 60 * 60 * 1000)  # 30 days in ms
+            
+            for i in range(1, 4):
+                event = {
+                    "event_id": f"$historical{i}:localhost",
+                    "type": "m.room.message",
+                    "sender": self.user_id,
+                    "room_id": room_id,
+                    "content": {"msgtype": "m.text", "body": f"Historical message {i}"},
+                    "origin_server_ts": thirty_days_ago + (i * 60000),  # 1 minute apart
+                }
+                historical_events.append(event)
+            
+            # Inject historical events
+            print(f"Injecting {len(historical_events)} historical events from 30 days ago...")
+            response = self.inject_room_events(room_id, historical_events)
+            print(f"Injection response: injected={response.get('injected_events')}, failed={response.get('failed_events')}")
+            
+            # Verify via backwards pagination
+            time.sleep(1)
+            messages = self.get_room_messages(room_id)
+            bodies = [m.get("content", {}).get("body") for m in messages 
+                     if m.get("type") == "m.room.message"]
+            
+            print(f"Messages via pagination: {bodies}")
+            
+            # Verify all messages are accessible
+            assert "Current message" in bodies
+            assert "Historical message 1" in bodies
+            assert "Historical message 2" in bodies
+            assert "Historical message 3" in bodies
+            
+            # Verify chronological order (oldest first in backwards pagination)
+            msg_events = [m for m in messages if m.get("type") == "m.room.message"]
+            timestamps = [m["origin_server_ts"] for m in msg_events]
+            
+            # Check timestamps are in descending order (backwards pagination)
+            for i in range(1, len(timestamps)):
+                assert timestamps[i-1] >= timestamps[i], "Messages should be in reverse chronological order"
+            
+            print("✓ Historical events accessible via pagination")
+            
+        finally:
+            self.stop_synapse()
+            print(f"\nTest files left in: {self.temp_dir}")
             
 
     def run_all_tests(self):
@@ -1069,6 +1134,7 @@ root:
             ("Room Created After Backup", self.test_room_created_after_backup),
             ("Minimal Event Recovery", self.test_minimal_event_recovery),
             ("Missing Events Between Existing", self.test_missing_events_between_existing),
+            ("Historical Events Pagination", self.test_historical_events_pagination),
         ]
         
         passed = 0
@@ -1114,11 +1180,13 @@ if __name__ == "__main__":
             test.test_minimal_event_recovery()
         elif test_name == "missing-between":
             test.test_missing_events_between_existing()
+        elif test_name == "historical":
+            test.test_historical_events_pagination()
         elif test_name == "all":
             test.run_all_tests()
         else:
             print(f"Unknown test: {test_name}")
-            print("Available tests: basic, membership, timestamps, functionality, room-after-backup, minimal, missing-between, all")
+            print("Available tests: basic, membership, timestamps, functionality, room-after-backup, minimal, missing-between, historical, all")
     else:
         # Default to basic recovery test
         test.test_basic_recovery()

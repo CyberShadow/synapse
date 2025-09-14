@@ -159,6 +159,21 @@ This document outlines the disaster recovery scenarios covered by the Synapse bu
    - No duplicate messages
    - Conversation flow is natural
 
+## Scenario 11: Historical Events with Old Timestamps
+
+**Test Location:** `test_disaster_recovery_integration.py::test_historical_events_pagination()`
+
+1. Room exists with current messages
+2. **Admin discovers historical messages from months/years ago** (old backups, archives)
+3. Historical events have very old timestamps (e.g., 30 days ago)
+4. Current timeline shows only recent messages
+5. **Admin injects historical events with preserved timestamps**
+6. **Expected result:**
+   - Historical messages are accessible via pagination
+   - Messages appear in correct chronological order
+   - Clients can paginate back to see full history
+   - No timeline corruption despite large timestamp differences
+
 ## Test Implementation Details
 
 ### Integration Tests
@@ -202,6 +217,7 @@ python test_disaster_recovery_integration.py functionality
 python test_disaster_recovery_integration.py room-after-backup
 python test_disaster_recovery_integration.py minimal
 python test_disaster_recovery_integration.py missing-between
+python test_disaster_recovery_integration.py historical
 
 # Run in container
 podman run --rm -v ".:/synapse" -w /synapse --entrypoint="" localhost/synapse-dev:latest \
