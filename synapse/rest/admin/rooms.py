@@ -1255,20 +1255,6 @@ class BulkEventInjectionServlet(RestServlet):
             
         for event in events_to_process:
             try:
-                # Check if event already exists
-                existing_event = await self._store.get_event(
-                    event.event_id, allow_none=True, allow_rejected=True
-                )
-                
-                if existing_event:
-                    # Event already exists - this is success for idempotency
-                    successfully_processed += 1
-                    logger.info(
-                        "Event %s already exists, skipping (idempotent)",
-                        event.event_id
-                    )
-                    continue
-                    
                 # Use the federation handler's event processing
                 # This automatically handles:
                 # - Auth validation
@@ -1288,29 +1274,18 @@ class BulkEventInjectionServlet(RestServlet):
                 logger.debug("Successfully processed event %s", event.event_id)
                 
             except Exception as e:
-                # Check if it's a duplicate event error
-                error_str = str(e)
-                if "UNIQUE constraint failed" in error_str or "duplicate key value" in error_str:
-                    # Event already exists - treat as success
-                    successfully_processed += 1
-                    logger.info(
-                        "Event %s already exists (caught via exception), treating as success",
-                        event.event_id
-                    )
-                else:
-                    # Real error
-                    logger.warning(
-                        "Failed to process event %s: %s",
-                        event.event_id,
-                        e
-                    )
-                    errors.append({
-                        "event_id": event.event_id,
-                        "error": str(e),
-                        "type": type(e).__name__
-                    })
+                logger.warning(
+                    "Failed to process event %s: %s",
+                    event.event_id,
+                    e
+                )
+                errors.append({
+                    "event_id": event.event_id,
+                    "error": str(e),
+                    "type": type(e).__name__
+                })
 
-        failed_count = len(errors)  # Only real errors count as failures
+        failed_count = len(events) - successfully_processed + len(errors)
         
         logger.info(
             "Processed %d/%d events successfully for room %s",
