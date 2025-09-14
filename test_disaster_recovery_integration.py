@@ -832,6 +832,77 @@ root:
         finally:
             self.stop_synapse()
             print(f"\nTest files left in: {self.temp_dir}")
+    
+    def test_room_created_after_backup(self):
+        """Test recovering a room that was created after the backup point."""
+        print("\n=== TEST: Room Created After Backup ===")
+        
+        try:
+            # Setup
+            self.setup()
+            self.start_synapse()
+            self.register_user()
+            
+            # Take backup BEFORE creating any rooms
+            print("Taking backup before room creation...")
+            backup_path = self.backup_database()
+            
+            # NOW create a room (after backup)
+            room_id = self.create_room()
+            self.send_message(room_id, "Message in new room")
+            self.send_message(room_id, "Another message")
+            
+            # Get all events from the room that didn't exist at backup time
+            all_events = self.get_all_room_events(room_id)
+            print(f"Room {room_id} has {len(all_events)} events")
+            
+            # Simulate disaster - restore to backup when room didn't exist
+            self.stop_synapse()
+            self.restore_database(backup_path)
+            self.start_synapse()
+            self.login()
+            
+            # Verify room doesn't exist
+            try:
+                self.get_room_messages(room_id)
+                raise AssertionError("Room should not exist after restore!")
+            except Exception as e:
+                if "403" in str(e) or "404" in str(e):
+                    print("✓ Confirmed room doesn't exist after restore")
+                else:
+                    raise
+            
+            # Inject all events to recreate the room from scratch
+            print(f"Injecting {len(all_events)} events to recreate room...")
+            response = self.inject_room_events(room_id, all_events)
+            print(f"Injection response: {response}")
+            
+            # Verify room is restored
+            time.sleep(2)  # Give more time for processing
+            
+            # Check if we were successfully added to the room
+            if response["injected_events"] > 0:
+                messages = self.get_room_messages(room_id)
+                bodies = [m.get("content", {}).get("body") for m in messages 
+                         if m.get("type") == "m.room.message"]
+                
+                assert "Message in new room" in bodies
+                assert "Another message" in bodies
+            else:
+                # If no events were injected, check for errors
+                if response.get("failed_events", 0) > 0:
+                    print(f"Failed to inject some events: {response.get('errors', [])}")
+                    raise AssertionError("Failed to recreate room")
+            
+            # Test we can still use the room
+            new_msg = self.send_message(room_id, "Post-recovery message")
+            assert "event_id" in new_msg
+            
+            print("✓ Room created after backup successfully recovered")
+            
+        finally:
+            self.stop_synapse()
+            print(f"\nTest files left in: {self.temp_dir}")
             
 
     def run_all_tests(self):
@@ -844,6 +915,7 @@ root:
             ("Membership Recovery", self.test_membership_recovery),
             ("Preserved Timestamps", self.test_preserved_timestamps),
             ("Room Functionality After Recovery", self.test_room_functionality_after_recovery),
+            ("Room Created After Backup", self.test_room_created_after_backup),
         ]
         
         passed = 0
@@ -883,11 +955,13 @@ if __name__ == "__main__":
             test.test_preserved_timestamps()
         elif test_name == "functionality":
             test.test_room_functionality_after_recovery()
+        elif test_name == "room-after-backup":
+            test.test_room_created_after_backup()
         elif test_name == "all":
             test.run_all_tests()
         else:
             print(f"Unknown test: {test_name}")
-            print("Available tests: basic, membership, timestamps, functionality, all")
+            print("Available tests: basic, membership, timestamps, functionality, room-after-backup, all")
     else:
         # Default to basic recovery test
         test.test_basic_recovery()

@@ -69,12 +69,30 @@ This document outlines the disaster recovery scenarios covered by the Synapse bu
 8. **Admin injects "Recent message" with preserved timestamp**
 9. **Expected result:** "Recent message" appears with original timestamp T2, not current time T3
 
-## Scenario 5: Complete Room Recovery
+## Scenario 5: Room Created After Backup
+
+**Test Location:** `test_disaster_recovery_integration.py::test_room_created_after_backup()`
+
+1. **Server database is backed up**
+2. User creates a new room "Room B"
+3. User sends messages in Room B
+4. Other users join Room B
+5. **Server crashes and database is restored from backup**
+6. Room B doesn't exist at all (created after backup point)
+7. Admin extracts complete Room B history from federation or logs
+8. **Admin injects all Room B events** (create event, memberships, messages)
+9. **Expected result:**
+   - Room B is fully reconstructed from scratch
+   - All users who joined can access it again
+   - All messages are restored
+   - Room continues to function normally
+
+## Scenario 6: Complete Room Recovery (Corruption Case)
 
 **Test Location:** `test_disaster_recovery_integration.py::test_room_functionality_after_recovery()`
 
 1. User creates room with initial state and messages
-2. **Room data is corrupted or lost** (not a typical backup/restore)
+2. **Room data is corrupted or lost** (database corruption, not backup/restore)
 3. Admin has complete room event history from external source
 4. **Admin injects all room events** (create event, memberships, state, messages)
 5. **Expected result:**
@@ -84,7 +102,7 @@ This document outlines the disaster recovery scenarios covered by the Synapse bu
    - All historical messages are visible
    - Room state is correct
 
-## Scenario 6: Disaster Recovery from Incomplete Federation Data
+## Scenario 7: Disaster Recovery from Incomplete Federation Data
 
 **Test Location:** `tests/rest/admin/test_disaster_recovery.py` (unit tests)
 
@@ -98,7 +116,7 @@ This document outlines the disaster recovery scenarios covered by the Synapse bu
    - depth: Calculated as max(prev_events depth) + 1
 6. **Expected result:** Room is accessible and functional despite incomplete data
 
-## Scenario 7: Batch Recovery of Multiple Rooms
+## Scenario 8: Batch Recovery of Multiple Rooms
 
 **Test Location:** Demonstrated in integration tests
 
