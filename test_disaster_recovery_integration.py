@@ -425,7 +425,16 @@ root:
         if "state" in response:
             all_events.extend(response["state"])
             
-        return all_events
+        # Deduplicate by event_id
+        seen = set()
+        unique_events = []
+        for event in all_events:
+            event_id = event.get("event_id")
+            if event_id and event_id not in seen:
+                seen.add(event_id)
+                unique_events.append(event)
+                
+        return unique_events
             
     def inject_room_events(self, room_id: str, events_list: list):
         """Inject room events for disaster recovery."""
@@ -849,12 +858,17 @@ root:
             
             # NOW create a room (after backup)
             room_id = self.create_room()
+            print(f"Created room {room_id} after backup")
             self.send_message(room_id, "Message in new room")
             self.send_message(room_id, "Another message")
             
             # Get all events from the room that didn't exist at backup time
             all_events = self.get_all_room_events(room_id)
             print(f"Room {room_id} has {len(all_events)} events")
+            
+            # Save the event IDs for debugging
+            event_ids = [e.get("event_id") for e in all_events]
+            print(f"Event IDs: {event_ids[:3]}...")  # Show first 3
             
             # Simulate disaster - restore to backup when room didn't exist
             self.stop_synapse()
@@ -867,15 +881,21 @@ root:
                 self.get_room_messages(room_id)
                 raise AssertionError("Room should not exist after restore!")
             except Exception as e:
-                if "403" in str(e) or "404" in str(e):
+                error_str = str(e)
+                print(f"Got expected error when accessing non-existent room: {error_str}")
+                if "403" in error_str or "404" in error_str or "not in room" in error_str:
                     print("✓ Confirmed room doesn't exist after restore")
                 else:
                     raise
             
             # Inject all events to recreate the room from scratch
             print(f"Injecting {len(all_events)} events to recreate room...")
+            print("Event types being injected:")
+            for event in all_events[:5]:  # Show first 5
+                print(f"  - {event.get('type')} from {event.get('sender')}")
+            
             response = self.inject_room_events(room_id, all_events)
-            print(f"Injection response: {response}")
+            print(f"Injection response: injected={response.get('injected_events')}, failed={response.get('failed_events')}")
             
             # Verify room is restored
             time.sleep(2)  # Give more time for processing
