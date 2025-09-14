@@ -224,6 +224,28 @@ podman run --rm -v ".:/synapse" -w /synapse --entrypoint="" localhost/synapse-de
   bash -c "PYTHONPATH=/synapse python -u test_disaster_recovery_integration.py all"
 ```
 
+## Scenario 22: Event ID Preservation During Recovery
+
+**Test Location:** `test_disaster_recovery_integration.py::test_event_id_preservation()`
+
+**Current Status:** ❌ FAILING - Events are assigned new IDs instead of preserving originals
+
+1. User sends messages in a room (room version 3+)
+2. **Server database is backed up**
+3. More messages are sent with specific event IDs
+4. External system records exact event data including IDs
+5. **Server crashes and database is restored from backup**
+6. Admin recovers events from external source
+7. **Admin injects events with their original event IDs**
+8. **Expected result:**
+   - Recovered events MUST have the same event IDs as originals
+   - No duplicate events are created
+   - Federation partners recognize events as the same ones
+   - Clients don't see duplicate messages
+   - Event ID hash validation passes
+
+**Critical Requirement:** For room versions 3+, event IDs are content-addressable (hash of canonical JSON). If the recovered event produces a different hash due to field differences, it will create a duplicate event with a different ID, breaking federation consistency and causing duplicate messages for users.
+
 ## Scenario 12: Encrypted Room Recovery
 
 **Test Location:** `test_disaster_recovery_integration.py::test_encrypted_room_recovery()`

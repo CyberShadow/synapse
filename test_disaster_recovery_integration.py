@@ -1766,6 +1766,120 @@ root:
         finally:
             self.stop_synapse()
             print(f"\nTest files left in: {self.temp_dir}")
+
+    def test_event_id_preservation(self):
+        """Test that recovered events maintain their original event IDs."""
+        print("\n=== TEST: Event ID Preservation ===")
+        
+        try:
+            # Setup
+            self.setup()
+            self.start_synapse()
+            self.register_user()
+            
+            # Create room with version 10 (content-addressable event IDs)
+            room_id = self.create_room(room_version="10")
+            print(f"Created room {room_id} with version 10")
+            
+            # Send initial messages
+            self.send_message(room_id, "Message before backup")
+            
+            # Backup database
+            backup_path = self.backup_database()
+            
+            # Send messages that we'll need to recover
+            msg1_response = self.send_message(room_id, "Message to recover 1")
+            msg1_id = msg1_response["event_id"]
+            print(f"Sent message 1 with ID: {msg1_id}")
+            
+            time.sleep(0.1)  # Ensure different timestamps
+            
+            msg2_response = self.send_message(room_id, "Message to recover 2")
+            msg2_id = msg2_response["event_id"]
+            print(f"Sent message 2 with ID: {msg2_id}")
+            
+            # Get the complete event data for both messages
+            all_events = self.get_all_room_events(room_id)
+            
+            # Find our specific events by ID
+            msg1_event = None
+            msg2_event = None
+            
+            for event in all_events:
+                if event.get("event_id") == msg1_id:
+                    msg1_event = event
+                elif event.get("event_id") == msg2_id:
+                    msg2_event = event
+                    
+            assert msg1_event is not None, f"Could not find event {msg1_id}"
+            assert msg2_event is not None, f"Could not find event {msg2_id}"
+            
+            # Store original event data
+            print("\nOriginal event 1 fields:")
+            for key in ["event_id", "type", "sender", "room_id", "content", "origin_server_ts", "auth_events", "prev_events", "depth"]:
+                if key in msg1_event:
+                    print(f"  {key}: {msg1_event[key]}")
+            
+            # Simulate disaster
+            self.stop_synapse()
+            self.restore_database(backup_path)
+            self.start_synapse()
+            self.login()
+            
+            # Inject events with complete original data
+            print("\nInjecting events with original data...")
+            response = self.inject_room_events(room_id, [msg1_event, msg2_event])
+            print(f"Injection response: {response}")
+            
+            # Check if event_id_mapping exists (indicates IDs changed)
+            if "event_id_mapping" in response:
+                mapping = response["event_id_mapping"]
+                print(f"\nWARNING: Event IDs changed during injection!")
+                print(f"Mapping: {mapping}")
+                
+                # Check if our events got new IDs
+                if msg1_id in mapping:
+                    new_id1 = mapping[msg1_id]
+                    assert msg1_id == new_id1, f"Event ID changed! Original: {msg1_id}, New: {new_id1}"
+                    
+                if msg2_id in mapping:
+                    new_id2 = mapping[msg2_id]
+                    assert msg2_id == new_id2, f"Event ID changed! Original: {msg2_id}, New: {new_id2}"
+            else:
+                print("\nNo event_id_mapping in response - checking if IDs were preserved...")
+            
+            # Verify events exist with correct IDs
+            time.sleep(1)
+            all_messages = self.get_room_messages(room_id)
+            
+            # Print all event IDs for debugging
+            print(f"\nAll event IDs in room after injection:")
+            for msg in all_messages:
+                if msg.get("type") == "m.room.message":
+                    print(f"  {msg.get('event_id')}: {msg.get('content', {}).get('body', '')}")
+            
+            found_ids = set()
+            for msg in all_messages:
+                event_id = msg.get("event_id")
+                if event_id in [msg1_id, msg2_id]:
+                    found_ids.add(event_id)
+                    
+            assert msg1_id in found_ids, f"Original event {msg1_id} not found after recovery"
+            assert msg2_id in found_ids, f"Original event {msg2_id} not found after recovery"
+            
+            # Check for duplicates
+            all_msg_bodies = [m.get("content", {}).get("body", "") for m in all_messages if m.get("type") == "m.room.message"]
+            msg1_count = all_msg_bodies.count("Message to recover 1")
+            msg2_count = all_msg_bodies.count("Message to recover 2")
+            
+            assert msg1_count == 1, f"Expected 1 copy of message 1, found {msg1_count} (duplicates indicate ID mismatch)"
+            assert msg2_count == 1, f"Expected 1 copy of message 2, found {msg2_count} (duplicates indicate ID mismatch)"
+            
+            print("\n✓ Event ID preservation test passed")
+            
+        finally:
+            self.stop_synapse()
+            print(f"\nTest files left in: {self.temp_dir}")
             
 
     def run_all_tests(self):
@@ -1786,6 +1900,7 @@ root:
             ("State Conflict Recovery", self.test_state_conflict_recovery),
             ("Redaction Recovery", self.test_redaction_recovery),
             ("Invite-Only Room Access Loss", self.test_invite_only_room_access_loss),
+            ("Event ID Preservation", self.test_event_id_preservation),
         ]
         
         passed = 0
@@ -1841,11 +1956,13 @@ if __name__ == "__main__":
             test.test_redaction_recovery()
         elif test_name == "invite-only":
             test.test_invite_only_room_access_loss()
+        elif test_name == "event-id":
+            test.test_event_id_preservation()
         elif test_name == "all":
             test.run_all_tests()
         else:
             print(f"Unknown test: {test_name}")
-            print("Available tests: basic, membership, timestamps, functionality, room-after-backup, minimal, missing-between, historical, encrypted, state-conflict, redaction, invite-only, all")
+            print("Available tests: basic, membership, timestamps, functionality, room-after-backup, minimal, missing-between, historical, encrypted, state-conflict, redaction, invite-only, event-id, all")
     else:
         # Default to basic recovery test
         test.test_basic_recovery()
