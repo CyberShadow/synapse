@@ -1285,7 +1285,7 @@ class BulkEventInjectionServlet(RestServlet):
                     "type": type(e).__name__
                 })
 
-        failed_count = len(events) - successfully_processed + len(errors)
+        failed_count = len(errors)  # Only actual errors count as failures
         
         logger.info(
             "Processed %d/%d events successfully for room %s",
