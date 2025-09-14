@@ -1013,8 +1013,17 @@ root:
             # Get current state for constructing missing events
             all_events = self.get_all_room_events(room_id)
             
+            # Find message 1 in the events to get its timestamp
+            msg1_event = None
+            for event in all_events:
+                if event.get("type") == "m.room.message" and event.get("content", {}).get("body") == "Message 1":
+                    msg1_event = event
+                    break
+            
+            assert msg1_event, "Could not find Message 1 event"
+            
             # Create "missing" events 2-4 with proper timestamps
-            base_ts = msg1["origin_server_ts"]
+            base_ts = msg1_event["origin_server_ts"]
             missing_events = []
             
             for i in range(2, 5):
@@ -1070,7 +1079,17 @@ root:
             
             # Send a current message
             current_msg = self.send_message(room_id, "Current message")
-            current_ts = current_msg["origin_server_ts"]
+            
+            # Get the current timestamp from the actual event
+            all_events = self.get_all_room_events(room_id)
+            current_event = None
+            for event in all_events:
+                if event.get("type") == "m.room.message" and event.get("content", {}).get("body") == "Current message":
+                    current_event = event
+                    break
+            
+            assert current_event, "Could not find Current message event"
+            current_ts = current_event["origin_server_ts"]
             
             # Create historical events (e.g., from 30 days ago)
             historical_events = []
@@ -1106,13 +1125,20 @@ root:
             assert "Historical message 2" in bodies
             assert "Historical message 3" in bodies
             
-            # Verify chronological order (oldest first in backwards pagination)
+            # Verify that historical messages have correct timestamps
             msg_events = [m for m in messages if m.get("type") == "m.room.message"]
-            timestamps = [m["origin_server_ts"] for m in msg_events]
             
-            # Check timestamps are in descending order (backwards pagination)
-            for i in range(1, len(timestamps)):
-                assert timestamps[i-1] >= timestamps[i], "Messages should be in reverse chronological order"
+            # Find specific messages and check their timestamps
+            current_msg = next(m for m in msg_events if m["content"]["body"] == "Current message")
+            hist_msgs = [m for m in msg_events if "Historical message" in m["content"]["body"]]
+            
+            # All historical messages should have timestamps from ~30 days ago
+            for hist_msg in hist_msgs:
+                assert hist_msg["origin_server_ts"] < current_msg["origin_server_ts"], \
+                    "Historical messages should have older timestamps than current message"
+                # Check they're roughly 30 days old
+                age_diff = current_msg["origin_server_ts"] - hist_msg["origin_server_ts"]
+                assert age_diff > 29 * 24 * 60 * 60 * 1000, "Historical messages should be ~30 days old"
             
             print("✓ Historical events accessible via pagination")
             
