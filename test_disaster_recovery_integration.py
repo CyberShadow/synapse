@@ -695,13 +695,9 @@ root:
             response = self.inject_room_events(room_id, bobs_events)
             print(f"Injection response: {response}")
             
-            # Check the response - even if events already existed, that's OK
-            if response["injected_events"] == 0 and response["failed_events"] == len(bobs_events):
-                # All events failed - check if it's because they already exist
-                if all("UNIQUE constraint failed" in str(err.get("error", "")) for err in response.get("errors", [])):
-                    print("Events already existed in database (expected in this test scenario)")
-                else:
-                    raise AssertionError(f"Failed to inject events: {response}")
+            # With idempotent injection, we should never have failures for duplicates
+            if response["failed_events"] > 0:
+                raise AssertionError(f"Failed to inject events: {response}")
             
             print("✓ Membership recovery test passed")
             
@@ -810,17 +806,9 @@ root:
             response = self.inject_room_events(room_id, all_events)
             print(f"Injection response: {response}")
             
-            # If all events already exist, that's OK for this test
-            if response["injected_events"] == 0:
-                if response.get("failed_events", 0) > 0:
-                    # Check if they failed because they already exist
-                    errors = response.get("errors", [])
-                    if all("UNIQUE constraint failed" in str(err.get("error", "")) for err in errors):
-                        print("Events already existed (room was not actually lost)")
-                    else:
-                        raise AssertionError(f"Failed to inject events: {errors}")
-                else:
-                    print("No events to inject (room intact)")
+            # With idempotent injection, existing events are counted as success
+            if response.get("failed_events", 0) > 0:
+                raise AssertionError(f"Failed to inject events: {response.get('errors', [])}")
             
             # Test room functionality
             time.sleep(1)
@@ -986,17 +974,11 @@ root:
             response = self.inject_room_events(room_id, minimal_events)
             print(f"Injection response: injected={response.get('injected_events')}, failed={response.get('failed_events')}")
             
-            # If they already exist, that's OK - we're testing the format works
+            # With idempotent injection, no failures expected
             if response.get("failed_events", 0) > 0:
-                errors = response.get("errors", [])
-                # Check if they're just duplicates
-                all_duplicates = all("UNIQUE constraint failed" in str(err.get("error", "")) for err in errors)
-                if all_duplicates:
-                    print("✓ Minimal events format accepted (events already existed)")
-                else:
-                    raise AssertionError(f"Unexpected errors: {errors}")
-            else:
-                print("✓ Minimal events successfully injected")
+                raise AssertionError(f"Unexpected errors: {response.get('errors', [])}")
+            
+            print("✓ Minimal events successfully injected")
             
             # Verify room is still functional
             new_msg = self.send_message(room_id, "Post-minimal-recovery message")
