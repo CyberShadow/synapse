@@ -1814,11 +1814,77 @@ root:
             assert msg1_event is not None, f"Could not find event {msg1_id}"
             assert msg2_event is not None, f"Could not find event {msg2_id}"
             
-            # Store original event data
-            print("\nOriginal event 1 fields:")
+            # The client API doesn't return internal fields needed for event ID calculation
+            # In a real disaster recovery, we'd have the complete event from federation or logs
+            # For testing, we need to construct what the complete event would look like
+            
+            # Get some context about the room state
+            latest_event = all_events[-1] if all_events else None
+            
+            # Simulate complete event data as it would exist internally
+            # These would normally come from federation or internal logs
+            
+            # For this test, we need to get some real auth events and prev events
+            # to create valid event structures
+            
+            # Find the create event and other auth events
+            create_event_id = None
+            member_event_id = None
+            prev_event_id = None
+            
+            for event in all_events:
+                if event.get("type") == "m.room.create":
+                    create_event_id = event["event_id"]
+                elif event.get("type") == "m.room.member" and event.get("state_key") == self.user_id:
+                    member_event_id = event["event_id"]
+                elif event.get("type") == "m.room.message" and event.get("content", {}).get("body") == "Message before backup":
+                    prev_event_id = event["event_id"]
+                    
+            # Construct auth events list (list of tuples)
+            auth_events = []
+            if create_event_id:
+                auth_events.append([create_event_id, {}])  # [event_id, {}]
+            if member_event_id:
+                auth_events.append([member_event_id, {}])
+                
+            # msg1 comes after "Message before backup"
+            msg1_complete = {
+                "event_id": msg1_id,
+                "type": msg1_event["type"],
+                "sender": msg1_event["sender"],
+                "room_id": msg1_event["room_id"],
+                "content": msg1_event["content"],
+                "origin_server_ts": msg1_event["origin_server_ts"],
+                # These fields are needed for event ID calculation
+                "auth_events": auth_events,
+                "prev_events": [[prev_event_id, {}]] if prev_event_id else [],
+                "depth": 10,
+                "origin": "localhost",
+                "hashes": {"sha256": "dummy"},  # Would be calculated
+                "signatures": {"localhost": {"ed25519:a_XLpe": "dummy"}}  # Would be real signatures
+            }
+            
+            # msg2 comes after msg1
+            msg2_complete = {
+                "event_id": msg2_id,
+                "type": msg2_event["type"],
+                "sender": msg2_event["sender"],
+                "room_id": msg2_event["room_id"],
+                "content": msg2_event["content"],
+                "origin_server_ts": msg2_event["origin_server_ts"],
+                "auth_events": auth_events,
+                "prev_events": [[msg1_id, {}]],  # This event comes after msg1
+                "depth": 11,
+                "origin": "localhost",
+                "hashes": {"sha256": "dummy"},
+                "signatures": {"localhost": {"ed25519:a_XLpe": "dummy"}}
+            }
+            
+            # Store original event data (use complete event)
+            print("\nOriginal event 1 fields (complete):")
             for key in ["event_id", "type", "sender", "room_id", "content", "origin_server_ts", "auth_events", "prev_events", "depth"]:
-                if key in msg1_event:
-                    print(f"  {key}: {msg1_event[key]}")
+                if key in msg1_complete:
+                    print(f"  {key}: {msg1_complete[key]}")
             
             # Simulate disaster
             self.stop_synapse()
@@ -1828,8 +1894,15 @@ root:
             
             # Inject events with complete original data
             print("\nInjecting events with original data...")
-            response = self.inject_room_events(room_id, [msg1_event, msg2_event])
-            print(f"Injection response: {response}")
+            
+            # Let's also inspect what we're actually sending
+            print("\nEvent being injected (first complete event):")
+            for key in ["event_id", "type", "sender", "room_id", "content", "origin_server_ts", "auth_events", "prev_events", "depth"]:
+                if key in msg1_complete:
+                    print(f"  {key}: {msg1_complete[key]}")
+            
+            response = self.inject_room_events(room_id, [msg1_complete, msg2_complete])
+            print(f"\nInjection response: {response}")
             
             # Check if event_id_mapping exists (indicates IDs changed)
             if "event_id_mapping" in response:
@@ -1857,6 +1930,55 @@ root:
             for msg in all_messages:
                 if msg.get("type") == "m.room.message":
                     print(f"  {msg.get('event_id')}: {msg.get('content', {}).get('body', '')}")
+            
+            # Find the injected event that should match msg1
+            injected_msg1 = None
+            for msg in all_messages:
+                if msg.get("type") == "m.room.message" and msg.get("content", {}).get("body") == "Message to recover 1":
+                    injected_msg1 = msg
+                    break
+                    
+            if injected_msg1:
+                print("\nComparing original vs injected event fields:")
+                print("Field differences that affect event ID hash:")
+                
+                # Get all events to see full event data
+                all_events_after = self.get_all_room_events(room_id)
+                for event in all_events_after:
+                    if event.get("event_id") == injected_msg1.get("event_id"):
+                        injected_full = event
+                        break
+                
+                # Compare fields that go into the hash
+                hash_fields = ["type", "sender", "room_id", "content", "origin_server_ts", "auth_events", "prev_events", "depth", "state_key", "origin", "hashes", "signatures"]
+                for field in hash_fields:
+                    orig_value = msg1_complete.get(field)
+                    injected_value = injected_full.get(field) if 'injected_full' in locals() else injected_msg1.get(field)
+                    if orig_value != injected_value:
+                        print(f"  {field}: DIFFERENT")
+                        print(f"    Original: {orig_value}")
+                        print(f"    Injected: {injected_value}")
+                    else:
+                        print(f"  {field}: Same")
+                
+                # Print ALL fields to find any differences
+                print("\nALL fields in injected event:")
+                if 'injected_full' in locals():
+                    for key in sorted(injected_full.keys()):
+                        if key not in ["unsigned", "event_id"]:
+                            print(f"  {key}: {injected_full[key]}")
+                
+                # Check what fields exist in one but not the other
+                orig_keys = set(msg1_complete.keys()) - {"unsigned", "event_id"}
+                injected_keys = set(injected_full.keys()) - {"unsigned", "event_id"} if 'injected_full' in locals() else set()
+                
+                missing_in_injected = orig_keys - injected_keys
+                extra_in_injected = injected_keys - orig_keys
+                
+                if missing_in_injected:
+                    print(f"\nFields missing in injected event: {missing_in_injected}")
+                if extra_in_injected:
+                    print(f"\nFields added in injected event: {extra_in_injected}")
             
             found_ids = set()
             for msg in all_messages:

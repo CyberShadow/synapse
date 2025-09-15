@@ -1212,20 +1212,46 @@ class BulkEventInjectionServlet(RestServlet):
                 # Track original event_id for mapping BEFORE prepare removes it
                 original_event_id = event_dict.get("event_id", "")
                 
+                # For disaster recovery, validate we have proper structure
+                if "auth_events" in event_dict:
+                    # Ensure auth_events is in the correct format
+                    auth_events = event_dict["auth_events"]
+                    if auth_events and not isinstance(auth_events[0], (list, tuple)):
+                        # Convert from simple list to tuples format
+                        event_dict["auth_events"] = [[e, {}] for e in auth_events]
+                        
+                if "prev_events" in event_dict:
+                    # Ensure prev_events is in the correct format
+                    prev_events = event_dict["prev_events"]
+                    if prev_events and not isinstance(prev_events[0], (list, tuple)):
+                        # Convert from simple list to tuples format
+                        event_dict["prev_events"] = [[e, {}] for e in prev_events]
+                
                 # Create event
                 event = make_event_from_dict(event_dict, room_version)
                 events.append(event)
                 
                 # Map original to actual event_id
                 if original_event_id:
-                    event_id_mapping[original_event_id] = event.event_id
+                    actual_event_id = event.event_id
+                    event_id_mapping[original_event_id] = actual_event_id
+                    
+                    # Log if event ID changed (for debugging disaster recovery)
+                    if original_event_id != actual_event_id:
+                        logger.warning(
+                            "Event ID changed during injection: %s -> %s",
+                            original_event_id,
+                            actual_event_id
+                        )
                     
             except Exception as e:
                 logger.exception("Failed to create event")
+                import traceback
                 errors.append({
-                    "event_id": event_dict.get("event_id", "unknown"),
+                    "event_id": event_dict.get("event_id", original_event_id or "unknown"),
                     "error": str(e),
-                    "type": type(e).__name__
+                    "type": type(e).__name__,
+                    "traceback": traceback.format_exc()
                 })
 
         if not events:
@@ -1299,7 +1325,11 @@ class BulkEventInjectionServlet(RestServlet):
     async def _prepare_event_dict(
         self, room_id: str, event_dict: JsonDict, room_version
     ) -> JsonDict:
-        """Prepare event dict by auto-populating missing fields."""
+        """Prepare event dict by auto-populating missing fields.
+        
+        For disaster recovery, we need to be careful to preserve fields
+        that affect the event ID calculation, especially for room v3+.
+        """
         # Make a copy to avoid modifying the original
         event_dict = dict(event_dict)
         
@@ -1309,28 +1339,60 @@ class BulkEventInjectionServlet(RestServlet):
         if missing:
             raise ValueError(f"Missing required fields: {missing}")
 
-        # Auto-populate auth_events if missing
+        # For disaster recovery with room v3+, check if we have an event_id
+        # and all fields needed to reproduce it
+        original_event_id = event_dict.get("event_id")
+        is_disaster_recovery = (
+            room_version.event_format >= 3 and 
+            original_event_id and
+            # These fields indicate this is a complete event from disaster recovery
+            all(field in event_dict for field in ["auth_events", "prev_events", "depth"])
+        )
+        
+        if is_disaster_recovery:
+            # This appears to be a complete event from disaster recovery
+            # We should preserve all fields to maintain the same event ID
+            logger.info(
+                "Disaster recovery mode for event %s - preserving all fields",
+                original_event_id
+            )
+            # Don't auto-populate fields that already exist
+            # Just remove event_id as it will be recomputed
+            event_dict.pop("event_id", None)
+            return event_dict
+
+        # Normal mode - auto-populate missing fields
+        # Auto-populate auth_events if missing or empty
         if not event_dict.get("auth_events"):
-            event_dict["auth_events"] = await self._get_auth_events_for_event(
+            auth_event_ids = await self._get_auth_events_for_event(
                 room_id,
                 event_dict["type"],
                 event_dict.get("state_key"),
                 event_dict["sender"]
             )
+            # Convert to tuples format: [[event_id, {}], ...]
+            event_dict["auth_events"] = [[event_id, {}] for event_id in auth_event_ids]
 
-        # Auto-populate prev_events if missing
+        # Auto-populate prev_events if missing or empty
         if not event_dict.get("prev_events"):
             # Get latest events in the room
             latest_event_ids = await self._store.get_latest_event_ids_in_room(room_id)
-            event_dict["prev_events"] = list(latest_event_ids)
+            # Convert to tuples format: [[event_id, {}], ...]
+            event_dict["prev_events"] = [[event_id, {}] for event_id in latest_event_ids]
 
         # Auto-calculate depth if missing
         if "depth" not in event_dict:
             if event_dict["prev_events"]:
+                # Extract event IDs from tuples format if needed
+                prev_event_ids = []
+                for item in event_dict["prev_events"]:
+                    if isinstance(item, list) and len(item) >= 1:
+                        prev_event_ids.append(item[0])
+                    else:
+                        prev_event_ids.append(item)
+                        
                 # Get max depth of prev events
-                max_depth = await self._store.get_max_depth_of(
-                    event_dict["prev_events"]
-                )
+                max_depth = await self._store.get_max_depth_of(prev_event_ids)
                 event_dict["depth"] = max_depth[1] + 1 if max_depth[1] is not None else 1
             else:
                 event_dict["depth"] = 1
