@@ -1538,88 +1538,61 @@ root:
             # Register admin and three users
             self.register_user()  # admin
             
-            # Register Alice (or login if already exists)
+            # Register Alice
             import hmac
             import hashlib
 
-            try:
-                alice_nonce_response = self._make_request("GET", f"http://localhost:{self.port}/_synapse/admin/v1/register")
-                alice_nonce = alice_nonce_response["nonce"]
+            alice_nonce_response = self._make_request("GET", f"http://localhost:{self.port}/_synapse/admin/v1/register")
+            alice_nonce = alice_nonce_response["nonce"]
 
-                alice_mac = hmac.new(
-                    b"test_secret",
-                    f"{alice_nonce}\x00alice\x00alice_pass\x00notadmin".encode(),
-                    hashlib.sha1
-                ).hexdigest()
+            alice_mac = hmac.new(
+                b"test_secret",
+                f"{alice_nonce}\x00alice\x00alice_pass\x00notadmin".encode(),
+                hashlib.sha1
+            ).hexdigest()
 
-                alice_response = self._make_request(
-                    "POST",
-                    f"http://localhost:{self.port}/_synapse/admin/v1/register",
-                    data={"nonce": alice_nonce, "username": "alice", "password": "alice_pass", "admin": False, "mac": alice_mac}
-                )
-                alice_token = alice_response["access_token"]
-            except Exception as e:
-                print(f"Alice registration failed ({e}), trying login...")
-                alice_response = self._make_request(
-                    "POST",
-                    f"http://localhost:{self.port}/_matrix/client/r0/login",
-                    data={"type": "m.login.password", "user": "alice", "password": "alice_pass"}
-                )
-                alice_token = alice_response["access_token"]
+            alice_response = self._make_request(
+                "POST",
+                f"http://localhost:{self.port}/_synapse/admin/v1/register",
+                data={"nonce": alice_nonce, "username": "alice", "password": "alice_pass", "admin": False, "mac": alice_mac}
+            )
+            alice_token = alice_response["access_token"]
             alice_id = "@alice:localhost"
 
-            # Register Bob (or login if already exists)
-            try:
-                bob_nonce_response = self._make_request("GET", f"http://localhost:{self.port}/_synapse/admin/v1/register")
-                bob_nonce = bob_nonce_response["nonce"]
+            # Register Bob
+            bob_nonce_response = self._make_request("GET", f"http://localhost:{self.port}/_synapse/admin/v1/register")
+            bob_nonce = bob_nonce_response["nonce"]
 
-                bob_mac = hmac.new(
-                    b"test_secret",
-                    f"{bob_nonce}\x00bob\x00bob_pass\x00notadmin".encode(),
-                    hashlib.sha1
-                ).hexdigest()
+            bob_mac = hmac.new(
+                b"test_secret",
+                f"{bob_nonce}\x00bob\x00bob_pass\x00notadmin".encode(),
+                hashlib.sha1
+            ).hexdigest()
 
-                bob_response = self._make_request(
-                    "POST",
-                    f"http://localhost:{self.port}/_synapse/admin/v1/register",
-                    data={"nonce": bob_nonce, "username": "bob", "password": "bob_pass", "admin": False, "mac": bob_mac}
-                )
-                bob_token = bob_response["access_token"]
-            except Exception as e:
-                print(f"Bob registration failed ({e}), trying login...")
-                bob_response = self._make_request(
-                    "POST",
-                    f"http://localhost:{self.port}/_matrix/client/r0/login",
-                    data={"type": "m.login.password", "user": "bob", "password": "bob_pass"}
-                )
-                bob_token = bob_response["access_token"]
+            bob_response = self._make_request(
+                "POST",
+                f"http://localhost:{self.port}/_synapse/admin/v1/register",
+                data={"nonce": bob_nonce, "username": "bob", "password": "bob_pass", "admin": False, "mac": bob_mac}
+            )
+            bob_token = bob_response["access_token"]
             bob_id = "@bob:localhost"
 
-            # Register Charlie (or login if already exists)
-            try:
-                charlie_nonce_response = self._make_request("GET", f"http://localhost:{self.port}/_synapse/admin/v1/register")
-                charlie_nonce = charlie_nonce_response["nonce"]
+            # Register Charlie
+            charlie_nonce_response = self._make_request("GET", f"http://localhost:{self.port}/_synapse/admin/v1/register")
+            charlie_nonce = charlie_nonce_response["nonce"]
 
-                charlie_mac = hmac.new(
-                    b"test_secret",
-                    f"{charlie_nonce}\x00charlie\x00charlie_pass\x00notadmin".encode(),
-                    hashlib.sha1
-                ).hexdigest()
+            charlie_mac = hmac.new(
+                b"test_secret",
+                f"{charlie_nonce}\x00charlie\x00charlie_pass\x00notadmin".encode(),
+                hashlib.sha1
+            ).hexdigest()
 
-                charlie_response = self._make_request(
-                    "POST",
-                    f"http://localhost:{self.port}/_synapse/admin/v1/register",
-                    data={"nonce": charlie_nonce, "username": "charlie", "password": "charlie_pass", "admin": False, "mac": charlie_mac}
-                )
-                charlie_token = charlie_response["access_token"]
-            except Exception as e:
-                print(f"Charlie registration failed ({e}), trying login...")
-                charlie_response = self._make_request(
-                    "POST",
-                    f"http://localhost:{self.port}/_matrix/client/r0/login",
-                    data={"type": "m.login.password", "user": "charlie", "password": "charlie_pass"}
-                )
-                charlie_token = charlie_response["access_token"]
+            charlie_response = self._make_request(
+                "POST",
+                f"http://localhost:{self.port}/_synapse/admin/v1/register",
+                data={"nonce": charlie_nonce, "username": "charlie", "password": "charlie_pass", "admin": False, "mac": charlie_mac}
+            )
+            charlie_token = charlie_response["access_token"]
             charlie_id = "@charlie:localhost"
             
             # Alice creates private invite-only room
@@ -2101,43 +2074,49 @@ root:
             print(f"\nTest files left in: {self.temp_dir}")
             
 
-    def run_all_tests(self):
-        """Run all disaster recovery test scenarios."""
+    @staticmethod
+    def run_all_tests():
+        """Run all disaster recovery test scenarios with isolated test instances."""
         print("\n=== DISASTER RECOVERY TEST SUITE ===\n")
-        
-        # Run each test separately to ensure clean state
+
+        # Each test gets a fresh instance with clean database
         tests = [
-            ("Basic Recovery", self.test_basic_recovery),
-            ("Membership Recovery", self.test_membership_recovery),
-            ("Preserved Timestamps", self.test_preserved_timestamps),
-            ("Room Functionality After Recovery", self.test_room_functionality_after_recovery),
-            ("Room Created After Backup", self.test_room_created_after_backup),
-            ("Minimal Event Recovery", self.test_minimal_event_recovery),
-            ("Missing Events Between Existing", self.test_missing_events_between_existing),
-            ("Historical Events Pagination", self.test_historical_events_pagination),
-            ("Encrypted Room Recovery", self.test_encrypted_room_recovery),
-            ("State Conflict Recovery", self.test_state_conflict_recovery),
-            ("Redaction Recovery", self.test_redaction_recovery),
-            ("Invite-Only Room Access Loss", self.test_invite_only_room_access_loss),
-            ("Event ID Preservation", self.test_event_id_preservation),
+            ("Basic Recovery", "test_basic_recovery"),
+            ("Membership Recovery", "test_membership_recovery"),
+            ("Preserved Timestamps", "test_preserved_timestamps"),
+            ("Room Functionality After Recovery", "test_room_functionality_after_recovery"),
+            ("Room Created After Backup", "test_room_created_after_backup"),
+            ("Minimal Event Recovery", "test_minimal_event_recovery"),
+            ("Missing Events Between Existing", "test_missing_events_between_existing"),
+            ("Historical Events Pagination", "test_historical_events_pagination"),
+            ("Encrypted Room Recovery", "test_encrypted_room_recovery"),
+            ("State Conflict Recovery", "test_state_conflict_recovery"),
+            ("Redaction Recovery", "test_redaction_recovery"),
+            ("Invite-Only Room Access Loss", "test_invite_only_room_access_loss"),
+            ("Event ID Preservation", "test_event_id_preservation"),
         ]
-        
+
         passed = 0
         failed = 0
-        
-        for test_name, test_method in tests:
+
+        for test_name, test_method_name in tests:
             try:
                 print(f"\nRunning: {test_name}")
+                # Create fresh test instance for complete isolation
+                test_instance = SynapseIntegrationTest()
+                test_method = getattr(test_instance, test_method_name)
                 test_method()
                 passed += 1
             except Exception as e:
                 print(f"\n✗ {test_name} FAILED: {e}")
+                import traceback
+                traceback.print_exc()
                 failed += 1
-        
+
         print(f"\n\n=== TEST SUMMARY ===")
         print(f"Passed: {passed}")
         print(f"Failed: {failed}")
-        
+
         if failed == 0:
             print("\n=== ALL TESTS PASSED ===")
         else:
@@ -2178,7 +2157,7 @@ if __name__ == "__main__":
         elif test_name == "event-id":
             test.test_event_id_preservation()
         elif test_name == "all":
-            test.run_all_tests()
+            SynapseIntegrationTest.run_all_tests()
         else:
             print(f"Unknown test: {test_name}")
             print("Available tests: basic, membership, timestamps, functionality, room-after-backup, minimal, missing-between, historical, encrypted, state-conflict, redaction, invite-only, event-id, all")
