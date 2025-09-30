@@ -1202,33 +1202,27 @@ class BulkEventInjectionServlet(RestServlet):
         errors = []
         event_id_mapping = {}
         
-        for event_dict in events_data:
+        for idx, event_dict in enumerate(events_data):
             try:
+                logger.debug("Processing event %d/%d", idx + 1, len(events_data))
+                
+                # Track original event_id for mapping BEFORE prepare removes it
+                original_event_id = event_dict.get("event_id", "")
+                
+                logger.info("Processing event %s", original_event_id or "(no id)")
+                
                 # Auto-populate missing fields
                 event_dict = await self._prepare_event_dict(
                     room_id, event_dict, room_version
                 )
                 
-                # Track original event_id for mapping BEFORE prepare removes it
-                original_event_id = event_dict.get("event_id", "")
-                
-                # For disaster recovery, validate we have proper structure
-                if "auth_events" in event_dict:
-                    # Ensure auth_events is in the correct format
-                    auth_events = event_dict["auth_events"]
-                    if auth_events and not isinstance(auth_events[0], (list, tuple)):
-                        # Convert from simple list to tuples format
-                        event_dict["auth_events"] = [[e, {}] for e in auth_events]
-                        
-                if "prev_events" in event_dict:
-                    # Ensure prev_events is in the correct format
-                    prev_events = event_dict["prev_events"]
-                    if prev_events and not isinstance(prev_events[0], (list, tuple)):
-                        # Convert from simple list to tuples format
-                        event_dict["prev_events"] = [[e, {}] for e in prev_events]
+                # The format checking is now done in _prepare_event_dict
+                # No need to check again here
                 
                 # Create event
+                logger.info("Creating event from dict with keys: %s", list(event_dict.keys()))
                 event = make_event_from_dict(event_dict, room_version)
+                logger.info("Created event %s", event.event_id)
                 events.append(event)
                 
                 # Map original to actual event_id
@@ -1247,11 +1241,22 @@ class BulkEventInjectionServlet(RestServlet):
             except Exception as e:
                 logger.exception("Failed to create event")
                 import traceback
+                tb = traceback.format_exc()
+                
+                # Debug print to see the actual error
+                print(f"\n=== DEBUG: Event creation error ===")
+                print(f"Original event ID: {original_event_id}")
+                print(f"Error: {e}")
+                print(f"Traceback:\n{tb}")
+                
+                # Use the original event ID if available, otherwise try to get from event_dict
+                # If neither exists, generate a placeholder
+                error_event_id = original_event_id or event_dict.get("event_id", "unknown")
                 errors.append({
-                    "event_id": event_dict.get("event_id", original_event_id or "unknown"),
+                    "event_id": error_event_id,
                     "error": str(e),
                     "type": type(e).__name__,
-                    "traceback": traceback.format_exc()
+                    "traceback": tb
                 })
 
         if not events:
@@ -1305,10 +1310,20 @@ class BulkEventInjectionServlet(RestServlet):
                     event.event_id,
                     e
                 )
+                import traceback
+                tb = traceback.format_exc()
+                
+                # Debug print
+                print(f"\n=== DEBUG: Event processing error ===")
+                print(f"Event ID: {event.event_id}")
+                print(f"Error: {e}")
+                print(f"Traceback:\n{tb}")
+                
                 errors.append({
                     "event_id": event.event_id,
                     "error": str(e),
-                    "type": type(e).__name__
+                    "type": type(e).__name__,
+                    "traceback": tb
                 })
 
         failed_count = len(errors)  # Only actual errors count as failures
@@ -1356,6 +1371,34 @@ class BulkEventInjectionServlet(RestServlet):
                 "Disaster recovery mode for event %s - preserving all fields",
                 original_event_id
             )
+            
+            # For room v3+, we need to ensure the correct format
+            if room_version.event_format >= EventFormatVersions.ROOM_V3:
+                # v3+ uses simple lists, not tuples
+                if "auth_events" in event_dict and event_dict["auth_events"]:
+                    # Convert from tuples format to simple list if needed
+                    if isinstance(event_dict["auth_events"][0], (list, tuple)):
+                        event_dict["auth_events"] = [e[0] for e in event_dict["auth_events"]]
+                        logger.info("Converted auth_events from tuple format to list for v3+")
+                        
+                if "prev_events" in event_dict and event_dict["prev_events"]:
+                    # Convert from tuples format to simple list if needed
+                    if isinstance(event_dict["prev_events"][0], (list, tuple)):
+                        event_dict["prev_events"] = [e[0] for e in event_dict["prev_events"]]
+                        logger.info("Converted prev_events from tuple format to list for v3+")
+            
+            # The key issue: We're removing event_id even in disaster recovery mode!
+            # For true event ID preservation, we should NOT remove the event_id
+            # if we have all the fields needed to reproduce it.
+            # 
+            # However, Synapse's event creation process (make_event_from_dict)
+            # will reject events with event_id for room v3+.
+            # This is the fundamental limitation.
+            logger.warning(
+                "Removing event_id for room v3+ even in disaster recovery mode. "
+                "This will cause a new event ID to be generated!"
+            )
+            
             # Don't auto-populate fields that already exist
             # Just remove event_id as it will be recomputed
             event_dict.pop("event_id", None)
@@ -1370,15 +1413,25 @@ class BulkEventInjectionServlet(RestServlet):
                 event_dict.get("state_key"),
                 event_dict["sender"]
             )
-            # Convert to tuples format: [[event_id, {}], ...]
-            event_dict["auth_events"] = [[event_id, {}] for event_id in auth_event_ids]
+            # Use correct format based on room version
+            if room_version.event_format >= EventFormatVersions.ROOM_V3:
+                # v3+ uses simple list
+                event_dict["auth_events"] = auth_event_ids
+            else:
+                # v1/v2 uses tuples format: [[event_id, {}], ...]
+                event_dict["auth_events"] = [[event_id, {}] for event_id in auth_event_ids]
 
         # Auto-populate prev_events if missing or empty
         if not event_dict.get("prev_events"):
             # Get latest events in the room
             latest_event_ids = await self._store.get_latest_event_ids_in_room(room_id)
-            # Convert to tuples format: [[event_id, {}], ...]
-            event_dict["prev_events"] = [[event_id, {}] for event_id in latest_event_ids]
+            # Use correct format based on room version
+            if room_version.event_format >= EventFormatVersions.ROOM_V3:
+                # v3+ uses simple list
+                event_dict["prev_events"] = list(latest_event_ids)
+            else:
+                # v1/v2 uses tuples format: [[event_id, {}], ...]
+                event_dict["prev_events"] = [[event_id, {}] for event_id in latest_event_ids]
 
         # Auto-calculate depth if missing
         if "depth" not in event_dict:

@@ -14,5 +14,5 @@ podman run --rm \
         export PYTHONPATH=/synapse
         
         # Run the integration test
-        python test_disaster_recovery_integration.py
+        python test_disaster_recovery_integration.py $1
     "

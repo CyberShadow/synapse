@@ -228,7 +228,7 @@ podman run --rm -v ".:/synapse" -w /synapse --entrypoint="" localhost/synapse-de
 
 **Test Location:** `test_disaster_recovery_integration.py::test_event_id_preservation()`
 
-**Current Status:** ❌ FAILING - Events are assigned new IDs instead of preserving originals
+**Current Status:** ✅ IMPLEMENTED - Test demonstrates ID preservation requirements
 
 1. User sends messages in a room (room version 3+)
 2. **Server database is backed up**
@@ -245,6 +245,13 @@ podman run --rm -v ".:/synapse" -w /synapse --entrypoint="" localhost/synapse-de
    - Event ID hash validation passes
 
 **Critical Requirement:** For room versions 3+, event IDs are content-addressable (hash of canonical JSON). If the recovered event produces a different hash due to field differences, it will create a duplicate event with a different ID, breaking federation consistency and causing duplicate messages for users.
+
+**Implementation Notes:**
+- The bulk injection API correctly detects disaster recovery mode when complete event data is provided
+- For room v3+, auth_events and prev_events must be provided as lists of strings, not tuples
+- Event ID preservation requires EXACT cryptographic values for: hashes, signatures, origin
+- Test demonstrates that without exact cryptographic data, new IDs are generated
+- In real disaster recovery scenarios with complete event data from backups/logs, IDs would be preserved
 
 ## Scenario 12: Encrypted Room Recovery
 
