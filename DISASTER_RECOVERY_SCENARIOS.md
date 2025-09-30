@@ -2,6 +2,16 @@
 
 This document outlines the disaster recovery scenarios covered by the Synapse bulk event injection API and their corresponding test implementations.
 
+## Implementation Status
+
+**✅ Implemented & Tested (13 scenarios):**
+- Scenarios 1-6, 9-14, 17, 22 have passing tests in `test_disaster_recovery_integration.py`
+
+**📋 Documented but Not Yet Implemented (6 scenarios):**
+- Scenarios 15, 16, 18, 19, 20, 21 are documented but tests not yet written
+
+---
+
 ## Scenario 1: Basic Message Recovery After Partial Data Loss
 
 **Test Location:** `test_disaster_recovery_integration.py::test_basic_recovery()`
@@ -250,8 +260,8 @@ podman run --rm -v ".:/synapse" -w /synapse --entrypoint="" localhost/synapse-de
 - The bulk injection API correctly detects disaster recovery mode when complete event data is provided
 - For room v3+, auth_events and prev_events must be provided as lists of strings, not tuples
 - Event ID preservation requires EXACT cryptographic values for: hashes, signatures, origin
-- Test demonstrates that without exact cryptographic data, new IDs are generated
-- In real disaster recovery scenarios with complete event data from backups/logs, IDs would be preserved
+- **Validation enforced:** If complete cryptographic data is provided but IDs don't match, the event is rejected (prevents desynchronization)
+- With complete data from database/federation, IDs are preserved; with incomplete data (client API), IDs change and mapping is returned
 
 ## Scenario 12: Encrypted Room Recovery
 

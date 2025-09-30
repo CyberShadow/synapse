@@ -1223,20 +1223,45 @@ class BulkEventInjectionServlet(RestServlet):
                 logger.info("Creating event from dict with keys: %s", list(event_dict.keys()))
                 event = make_event_from_dict(event_dict, room_version)
                 logger.info("Created event %s", event.event_id)
-                events.append(event)
-                
-                # Map original to actual event_id
+
+                # Validate event ID for disaster recovery mode
                 if original_event_id:
                     actual_event_id = event.event_id
-                    event_id_mapping[original_event_id] = actual_event_id
-                    
-                    # Log if event ID changed (for debugging disaster recovery)
-                    if original_event_id != actual_event_id:
-                        logger.warning(
-                            "Event ID changed during injection: %s -> %s",
+
+                    # Check if this was a disaster recovery event (complete data provided)
+                    # For room v3+, if complete cryptographic data was provided, IDs must match
+                    was_complete_event = all(
+                        k in events_data[idx] for k in
+                        ["auth_events", "prev_events", "depth", "hashes", "signatures"]
+                    )
+
+                    if was_complete_event and room_version.event_format >= 3:
+                        # This was a complete event with cryptographic data
+                        # The recalculated ID MUST match the original
+                        if original_event_id != actual_event_id:
+                            raise SynapseError(
+                                400,
+                                f"Event ID mismatch: provided complete event data with ID "
+                                f"{original_event_id} but calculated ID is {actual_event_id}. "
+                                f"This indicates the provided cryptographic data (hashes/signatures) "
+                                f"does not match the event content. Rejecting to prevent "
+                                f"federation desynchronization.",
+                                Codes.BAD_JSON
+                            )
+                        logger.info(
+                            "Event ID validated: %s (disaster recovery mode)",
+                            original_event_id
+                        )
+                    elif original_event_id != actual_event_id:
+                        # Incomplete event data - ID change is expected
+                        logger.info(
+                            "Event ID changed (expected for incomplete data): %s -> %s",
                             original_event_id,
                             actual_event_id
                         )
+                        event_id_mapping[original_event_id] = actual_event_id
+
+                events.append(event)
                     
             except Exception as e:
                 logger.exception("Failed to create event")
@@ -1387,20 +1412,11 @@ class BulkEventInjectionServlet(RestServlet):
                         event_dict["prev_events"] = [e[0] for e in event_dict["prev_events"]]
                         logger.info("Converted prev_events from tuple format to list for v3+")
             
-            # The key issue: We're removing event_id even in disaster recovery mode!
-            # For true event ID preservation, we should NOT remove the event_id
-            # if we have all the fields needed to reproduce it.
-            # 
-            # However, Synapse's event creation process (make_event_from_dict)
-            # will reject events with event_id for room v3+.
-            # This is the fundamental limitation.
-            logger.warning(
-                "Removing event_id for room v3+ even in disaster recovery mode. "
-                "This will cause a new event ID to be generated!"
-            )
-            
-            # Don't auto-populate fields that already exist
-            # Just remove event_id as it will be recomputed
+            # Remove event_id before event creation (required by FrozenEventV2 assertion)
+            # For room v3+, event IDs are content-addressable - they're calculated from
+            # the event's content. If the provided data is complete (including hashes,
+            # signatures), the recalculated ID will match the original. This is validated
+            # after event creation to ensure no desynchronization occurs.
             event_dict.pop("event_id", None)
             return event_dict
 

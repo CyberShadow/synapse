@@ -1538,60 +1538,88 @@ root:
             # Register admin and three users
             self.register_user()  # admin
             
-            # Register Alice
-            alice_nonce_response = self._make_request("GET", f"http://localhost:{self.port}/_synapse/admin/v1/register")
-            alice_nonce = alice_nonce_response["nonce"]
-            
+            # Register Alice (or login if already exists)
             import hmac
             import hashlib
-            alice_mac = hmac.new(
-                b"test_secret",
-                f"{alice_nonce}\x00alice\x00alice_pass\x00notadmin".encode(),
-                hashlib.sha1
-            ).hexdigest()
-            
-            alice_response = self._make_request(
-                "POST",
-                f"http://localhost:{self.port}/_synapse/admin/v1/register",
-                data={"nonce": alice_nonce, "username": "alice", "password": "alice_pass", "admin": False, "mac": alice_mac}
-            )
-            alice_token = alice_response["access_token"]
+
+            try:
+                alice_nonce_response = self._make_request("GET", f"http://localhost:{self.port}/_synapse/admin/v1/register")
+                alice_nonce = alice_nonce_response["nonce"]
+
+                alice_mac = hmac.new(
+                    b"test_secret",
+                    f"{alice_nonce}\x00alice\x00alice_pass\x00notadmin".encode(),
+                    hashlib.sha1
+                ).hexdigest()
+
+                alice_response = self._make_request(
+                    "POST",
+                    f"http://localhost:{self.port}/_synapse/admin/v1/register",
+                    data={"nonce": alice_nonce, "username": "alice", "password": "alice_pass", "admin": False, "mac": alice_mac}
+                )
+                alice_token = alice_response["access_token"]
+            except Exception as e:
+                print(f"Alice registration failed ({e}), trying login...")
+                alice_response = self._make_request(
+                    "POST",
+                    f"http://localhost:{self.port}/_matrix/client/r0/login",
+                    data={"type": "m.login.password", "user": "alice", "password": "alice_pass"}
+                )
+                alice_token = alice_response["access_token"]
             alice_id = "@alice:localhost"
-            
-            # Register Bob
-            bob_nonce_response = self._make_request("GET", f"http://localhost:{self.port}/_synapse/admin/v1/register")
-            bob_nonce = bob_nonce_response["nonce"]
-            
-            bob_mac = hmac.new(
-                b"test_secret",
-                f"{bob_nonce}\x00bob\x00bob_pass\x00notadmin".encode(),
-                hashlib.sha1
-            ).hexdigest()
-            
-            bob_response = self._make_request(
-                "POST",
-                f"http://localhost:{self.port}/_synapse/admin/v1/register",
-                data={"nonce": bob_nonce, "username": "bob", "password": "bob_pass", "admin": False, "mac": bob_mac}
-            )
-            bob_token = bob_response["access_token"]
+
+            # Register Bob (or login if already exists)
+            try:
+                bob_nonce_response = self._make_request("GET", f"http://localhost:{self.port}/_synapse/admin/v1/register")
+                bob_nonce = bob_nonce_response["nonce"]
+
+                bob_mac = hmac.new(
+                    b"test_secret",
+                    f"{bob_nonce}\x00bob\x00bob_pass\x00notadmin".encode(),
+                    hashlib.sha1
+                ).hexdigest()
+
+                bob_response = self._make_request(
+                    "POST",
+                    f"http://localhost:{self.port}/_synapse/admin/v1/register",
+                    data={"nonce": bob_nonce, "username": "bob", "password": "bob_pass", "admin": False, "mac": bob_mac}
+                )
+                bob_token = bob_response["access_token"]
+            except Exception as e:
+                print(f"Bob registration failed ({e}), trying login...")
+                bob_response = self._make_request(
+                    "POST",
+                    f"http://localhost:{self.port}/_matrix/client/r0/login",
+                    data={"type": "m.login.password", "user": "bob", "password": "bob_pass"}
+                )
+                bob_token = bob_response["access_token"]
             bob_id = "@bob:localhost"
-            
-            # Register Charlie
-            charlie_nonce_response = self._make_request("GET", f"http://localhost:{self.port}/_synapse/admin/v1/register")
-            charlie_nonce = charlie_nonce_response["nonce"]
-            
-            charlie_mac = hmac.new(
-                b"test_secret",
-                f"{charlie_nonce}\x00charlie\x00charlie_pass\x00notadmin".encode(),
-                hashlib.sha1
-            ).hexdigest()
-            
-            charlie_response = self._make_request(
-                "POST",
-                f"http://localhost:{self.port}/_synapse/admin/v1/register",
-                data={"nonce": charlie_nonce, "username": "charlie", "password": "charlie_pass", "admin": False, "mac": charlie_mac}
-            )
-            charlie_token = charlie_response["access_token"]
+
+            # Register Charlie (or login if already exists)
+            try:
+                charlie_nonce_response = self._make_request("GET", f"http://localhost:{self.port}/_synapse/admin/v1/register")
+                charlie_nonce = charlie_nonce_response["nonce"]
+
+                charlie_mac = hmac.new(
+                    b"test_secret",
+                    f"{charlie_nonce}\x00charlie\x00charlie_pass\x00notadmin".encode(),
+                    hashlib.sha1
+                ).hexdigest()
+
+                charlie_response = self._make_request(
+                    "POST",
+                    f"http://localhost:{self.port}/_synapse/admin/v1/register",
+                    data={"nonce": charlie_nonce, "username": "charlie", "password": "charlie_pass", "admin": False, "mac": charlie_mac}
+                )
+                charlie_token = charlie_response["access_token"]
+            except Exception as e:
+                print(f"Charlie registration failed ({e}), trying login...")
+                charlie_response = self._make_request(
+                    "POST",
+                    f"http://localhost:{self.port}/_matrix/client/r0/login",
+                    data={"type": "m.login.password", "user": "charlie", "password": "charlie_pass"}
+                )
+                charlie_token = charlie_response["access_token"]
             charlie_id = "@charlie:localhost"
             
             # Alice creates private invite-only room
