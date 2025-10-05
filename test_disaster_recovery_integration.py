@@ -2162,5 +2162,5 @@ if __name__ == "__main__":
             print(f"Unknown test: {test_name}")
             print("Available tests: basic, membership, timestamps, functionality, room-after-backup, minimal, missing-between, historical, encrypted, state-conflict, redaction, invite-only, event-id, all")
     else:
-        # Default to basic recovery test
-        test.test_basic_recovery()
+        # Default to running all tests
+        SynapseIntegrationTest.run_all_tests()
