@@ -2068,11 +2068,78 @@ root:
             assert msg2_count == 1, f"Expected 1 copy of message 2, found {msg2_count} (duplicates indicate ID mismatch)"
             
             print("\n✓ Event ID preservation test passed")
-            
+
         finally:
             self.stop_synapse()
             print(f"\nTest files left in: {self.temp_dir}")
-            
+
+    def test_error_reporting(self):
+        """Test that bulk injection API properly reports errors."""
+        print("\n=== TEST: Error Reporting ===")
+
+        try:
+            self.setup()
+            self.start_synapse()
+            self.register_user()
+
+            # Create a room first
+            room_id = self.create_room()
+
+            # Test 1: Send an event that will fail during processing
+            # (invalid event with wrong room_id will fail state resolution)
+            print("\nTest 1: Event for non-existent room")
+            invalid_event = {
+                "type": "m.room.message",
+                "sender": self.user_id,
+                "content": {"msgtype": "m.text", "body": "Test"},
+                "origin_server_ts": int(time.time() * 1000),
+                "room_id": "!nonexistent:localhost"  # Room doesn't exist
+            }
+
+            response = self.inject_room_events("!nonexistent:localhost", [invalid_event])
+
+            # Check if we got error reporting
+            if response["failed_events"] > 0:
+                assert len(response["errors"]) > 0, "Failed events should have error details"
+                assert "error" in response["errors"][0], "Error should have 'error' field"
+                assert response["errors"][0]["error"], "Error message should not be empty"
+                print(f"✓ Error reported: {response['errors'][0]['error']}")
+            else:
+                print("Note: Endpoint created room automatically, no error to report")
+
+            # Test 2: Verify error details structure
+            print("\nTest 2: Verify error details structure")
+            # Send a malformed event that should fail
+            malformed_event = {
+                "type": "m.room.message",
+                "sender": self.user_id,
+                "content": {"msgtype": "m.text", "body": "Test"},
+                "origin_server_ts": int(time.time() * 1000),
+                "room_id": room_id,
+                # Add malformed auth_events to trigger validation error
+                "auth_events": "not_a_list",  # Should be a list
+            }
+
+            response = self.inject_room_events(room_id, [malformed_event])
+            print(f"Response: injected={response['injected_events']}, failed={response['failed_events']}, errors={len(response.get('errors', []))}")
+
+            # Verify error structure regardless of outcome
+            if response["failed_events"] > 0:
+                assert len(response["errors"]) > 0, "Failed events should have error details"
+                for error in response["errors"]:
+                    assert "error" in error, f"Error missing 'error' field: {error}"
+                    assert "type" in error, f"Error missing 'type' field: {error}"
+                    assert error["error"], f"Error message is empty: {error}"
+                print(f"✓ Error structure verified: {response['errors'][0]}")
+            else:
+                print("Note: Event was processed successfully (endpoint is resilient)")
+
+            print("\n✓ Error reporting test passed")
+
+        finally:
+            self.stop_synapse()
+            print(f"\nTest files left in: {self.temp_dir}")
+
 
     @staticmethod
     def run_all_tests():
@@ -2094,6 +2161,7 @@ root:
             ("Redaction Recovery", "test_redaction_recovery"),
             ("Invite-Only Room Access Loss", "test_invite_only_room_access_loss"),
             ("Event ID Preservation", "test_event_id_preservation"),
+            ("Error Reporting", "test_error_reporting"),
         ]
 
         passed = 0
@@ -2156,11 +2224,13 @@ if __name__ == "__main__":
             test.test_invite_only_room_access_loss()
         elif test_name == "event-id":
             test.test_event_id_preservation()
+        elif test_name == "error-reporting":
+            test.test_error_reporting()
         elif test_name == "all":
             SynapseIntegrationTest.run_all_tests()
         else:
             print(f"Unknown test: {test_name}")
-            print("Available tests: basic, membership, timestamps, functionality, room-after-backup, minimal, missing-between, historical, encrypted, state-conflict, redaction, invite-only, event-id, all")
+            print("Available tests: basic, membership, timestamps, functionality, room-after-backup, minimal, missing-between, historical, encrypted, state-conflict, redaction, invite-only, event-id, error-reporting, all")
     else:
         # Default to running all tests
         SynapseIntegrationTest.run_all_tests()

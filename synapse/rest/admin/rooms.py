@@ -1264,19 +1264,20 @@ class BulkEventInjectionServlet(RestServlet):
                 events.append(event)
                     
             except Exception as e:
-                logger.exception("Failed to create event")
                 import traceback
                 tb = traceback.format_exc()
-                
-                # Debug print to see the actual error
-                print(f"\n=== DEBUG: Event creation error ===")
-                print(f"Original event ID: {original_event_id}")
-                print(f"Error: {e}")
-                print(f"Traceback:\n{tb}")
-                
+
                 # Use the original event ID if available, otherwise try to get from event_dict
-                # If neither exists, generate a placeholder
                 error_event_id = original_event_id or event_dict.get("event_id", "unknown")
+
+                logger.error(
+                    "Failed to create event %s in room %s: %s\nTraceback:\n%s",
+                    error_event_id,
+                    room_id,
+                    e,
+                    tb
+                )
+
                 errors.append({
                     "event_id": error_event_id,
                     "error": str(e),
@@ -1330,20 +1331,18 @@ class BulkEventInjectionServlet(RestServlet):
                 logger.debug("Successfully processed event %s", event.event_id)
                 
             except Exception as e:
-                logger.warning(
-                    "Failed to process event %s: %s",
-                    event.event_id,
-                    e
-                )
                 import traceback
                 tb = traceback.format_exc()
-                
-                # Debug print
-                print(f"\n=== DEBUG: Event processing error ===")
-                print(f"Event ID: {event.event_id}")
-                print(f"Error: {e}")
-                print(f"Traceback:\n{tb}")
-                
+
+                # Use logger.error so it always appears in logs
+                logger.error(
+                    "Failed to process event %s in room %s: %s\nTraceback:\n%s",
+                    event.event_id,
+                    room_id,
+                    e,
+                    tb
+                )
+
                 errors.append({
                     "event_id": event.event_id,
                     "error": str(e),
@@ -1352,14 +1351,24 @@ class BulkEventInjectionServlet(RestServlet):
                 })
 
         failed_count = len(errors)  # Only actual errors count as failures
-        
+
+        if failed_count > 0:
+            logger.error(
+                "Room %s: %d/%d events failed to process. Errors: %s",
+                room_id,
+                failed_count,
+                len(events),
+                [{"event_id": e["event_id"], "error": e["error"]} for e in errors]
+            )
+
         logger.info(
-            "Processed %d/%d events successfully for room %s",
+            "Processed %d/%d events successfully for room %s (failed: %d)",
             successfully_processed,
             len(events),
-            room_id
+            room_id,
+            failed_count
         )
-        
+
         return successfully_processed, failed_count, errors, event_id_mapping
 
     async def _prepare_event_dict(
