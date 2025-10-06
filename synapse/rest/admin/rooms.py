@@ -1483,16 +1483,13 @@ class BulkEventInjectionServlet(RestServlet):
                 event_dict.pop("event_id")
         else:
             # For v1/v2, event_id MUST be in dict
-            # Generate a placeholder if missing (will be properly calculated after event creation)
+            # We require it to be provided (from disaster recovery backup)
+            # to preserve original event IDs
             if "event_id" not in event_dict:
-                import time
-                import random
-                # Generate a v1-style placeholder ID
-                # Format: $<timestamp><random>:<server>
-                timestamp = int(time.time() * 1000)
-                random_str = ''.join(random.choices('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=16))
-                server = event_dict.get("sender", "@user:localhost").split(":")[1]
-                event_dict["event_id"] = f"${timestamp}{random_str}:{server}"
+                raise ValueError(
+                    f"event_id is required for room version {room_version.identifier} events. "
+                    "For disaster recovery, event_id should be provided from the backup database."
+                )
 
         return event_dict
 

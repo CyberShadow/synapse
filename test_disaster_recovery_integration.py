@@ -2154,7 +2154,10 @@ root:
             room_id = "!v1room:localhost"
             ts = int(time.time() * 1000)
 
+            # v1/v2 events use reference hash format event IDs
+            # Format: $<base64-hash>:<server>
             create_event = {
+                "event_id": "$create12345abcdef:localhost",
                 "type": "m.room.create",
                 "state_key": "",
                 "sender": self.user_id,
@@ -2167,6 +2170,7 @@ root:
             }
 
             message_event = {
+                "event_id": "$message67890xyz:localhost",
                 "type": "m.room.message",
                 "sender": self.user_id,
                 "room_id": room_id,
