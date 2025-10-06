@@ -2140,6 +2140,71 @@ root:
             self.stop_synapse()
             print(f"\nTest files left in: {self.temp_dir}")
 
+    def test_room_version_1(self):
+        """Test that room version 1 events (without explicit room_version) are handled correctly."""
+        print("\n=== TEST: Room Version 1 ===")
+
+        try:
+            self.setup()
+            self.start_synapse()
+            self.register_user()
+
+            # Create a room version 1 create event
+            # In v1, the create event does NOT have room_version in content
+            room_id = "!v1room:localhost"
+            ts = int(time.time() * 1000)
+
+            create_event = {
+                "type": "m.room.create",
+                "state_key": "",
+                "sender": self.user_id,
+                "room_id": room_id,
+                "content": {
+                    "creator": self.user_id,
+                    # NO room_version field - this is room version 1
+                },
+                "origin_server_ts": ts,
+            }
+
+            message_event = {
+                "type": "m.room.message",
+                "sender": self.user_id,
+                "room_id": room_id,
+                "content": {"msgtype": "m.text", "body": "Test message in v1 room"},
+                "origin_server_ts": ts + 1000,
+            }
+
+            print("\nUploading room version 1 events (no room_version in create event)...")
+            response = self.inject_room_events(room_id, [create_event, message_event])
+
+            print(f"Response: {json.dumps(response, indent=2)}")
+
+            assert response["injected_events"] == 2, \
+                f"Expected 2 events injected, got {response['injected_events']}. Errors: {response.get('errors', [])}"
+            assert response["failed_events"] == 0, \
+                f"Expected 0 failures, got {response['failed_events']} errors: {response.get('errors', [])}"
+
+            print(f"✓ Injected {response['injected_events']} events successfully")
+
+            # Verify the room was created with version 1
+            print("\nVerifying room version in database...")
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT room_version FROM rooms WHERE room_id = ?", (room_id,))
+            row = cursor.fetchone()
+            conn.close()
+
+            assert row is not None, f"Room {room_id} not found in database"
+            room_version = row[0]
+            print(f"Room version in database: {room_version}")
+            assert room_version == "1", f"Expected room version 1, got {room_version}"
+
+            print("\n✓ Room version 1 test passed")
+
+        finally:
+            self.stop_synapse()
+            print(f"\nTest files left in: {self.temp_dir}")
+
 
     @staticmethod
     def run_all_tests():
@@ -2162,6 +2227,7 @@ root:
             ("Invite-Only Room Access Loss", "test_invite_only_room_access_loss"),
             ("Event ID Preservation", "test_event_id_preservation"),
             ("Error Reporting", "test_error_reporting"),
+            ("Room Version 1", "test_room_version_1"),
         ]
 
         passed = 0
@@ -2226,11 +2292,13 @@ if __name__ == "__main__":
             test.test_event_id_preservation()
         elif test_name == "error-reporting":
             test.test_error_reporting()
+        elif test_name == "room-version-1":
+            test.test_room_version_1()
         elif test_name == "all":
             SynapseIntegrationTest.run_all_tests()
         else:
             print(f"Unknown test: {test_name}")
-            print("Available tests: basic, membership, timestamps, functionality, room-after-backup, minimal, missing-between, historical, encrypted, state-conflict, redaction, invite-only, event-id, error-reporting, all")
+            print("Available tests: basic, membership, timestamps, functionality, room-after-backup, minimal, missing-between, historical, encrypted, state-conflict, redaction, invite-only, event-id, error-reporting, room-version-1, all")
     else:
         # Default to running all tests
         SynapseIntegrationTest.run_all_tests()

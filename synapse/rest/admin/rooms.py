@@ -1160,7 +1160,8 @@ class BulkEventInjectionServlet(RestServlet):
 
         # Extract room version
         content = create_event_dict.get("content", {})
-        room_version_id = content.get("room_version", "10")
+        # Default to v1 for rooms without explicit version (original Matrix spec)
+        room_version_id = content.get("room_version", RoomVersions.V1.identifier)
         
         try:
             room_version = getattr(RoomVersions, f"V{room_version_id}")
@@ -1475,9 +1476,23 @@ class BulkEventInjectionServlet(RestServlet):
             else:
                 event_dict["depth"] = 1
 
-        # For room v3+, remove event_id as it's computed
-        if room_version.event_format >= 3 and "event_id" in event_dict:
-            event_dict.pop("event_id", None)
+        # Handle event_id based on room version
+        if room_version.event_format >= EventFormatVersions.ROOM_V3:
+            # For v3+, event_id MUST NOT be in dict (it's computed from content)
+            if "event_id" in event_dict:
+                event_dict.pop("event_id")
+        else:
+            # For v1/v2, event_id MUST be in dict
+            # Generate a placeholder if missing (will be properly calculated after event creation)
+            if "event_id" not in event_dict:
+                import time
+                import random
+                # Generate a v1-style placeholder ID
+                # Format: $<timestamp><random>:<server>
+                timestamp = int(time.time() * 1000)
+                random_str = ''.join(random.choices('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=16))
+                server = event_dict.get("sender", "@user:localhost").split(":")[1]
+                event_dict["event_id"] = f"${timestamp}{random_str}:{server}"
 
         return event_dict
 
