@@ -1387,10 +1387,23 @@ class BulkEventInjectionServlet(RestServlet):
             failed_count
         )
 
-        # CRITICAL: Rebuild current_state_events from the imported events
-        # This is necessary because bulk injection doesn't automatically update current state
+        # CRITICAL: Rebuild forward extremities and current_state_events from the imported events
+        # This is necessary because bulk injection doesn't automatically update these tables
         if successfully_processed > 0:
             try:
+                # First, recalculate forward extremities
+                # Forward extremities are events that have no children (not referenced in prev_events)
+                logger.info(
+                    "Recalculating forward extremities for room %s after bulk injection",
+                    room_id
+                )
+                await self._recalculate_forward_extremities(room_id)
+                logger.info(
+                    "Successfully recalculated forward extremities for room %s",
+                    room_id
+                )
+
+                # Then rebuild current_state_events based on the new forward extremities
                 logger.info(
                     "Rebuilding current_state_events for room %s after bulk injection",
                     room_id
@@ -1402,13 +1415,128 @@ class BulkEventInjectionServlet(RestServlet):
                 )
             except Exception as e:
                 logger.error(
-                    "Failed to rebuild current_state_events for room %s: %s",
+                    "Failed to rebuild room state for room %s: %s",
                     room_id,
                     e,
                     exc_info=True
                 )
+                # Re-raise the exception - this is a critical failure
+                # Without correct forward extremities and current state, the room is broken
+                raise
 
         return successfully_processed, failed_count, errors, event_id_mapping
+
+    async def _recalculate_forward_extremities(self, room_id: str) -> None:
+        """Recalculate forward extremities for a room after bulk event injection.
+
+        Forward extremities are events that have no children - i.e., events that are
+        not referenced in any other event's prev_events.
+
+        This is necessary because bulk injection bypasses normal event persistence
+        which would update forward extremities incrementally.
+        """
+
+        def _recalculate_forward_extremities_txn(txn):
+            # Forward extremities are ALWAYS among the most recent events in a room.
+            # For efficiency, we only examine the last 1000 events by stream_ordering.
+            # This handles even complex DAGs with many branches while avoiding
+            # loading millions of events into memory.
+
+            # Get the most recent events (candidates for forward extremities)
+            sql = """
+                SELECT e.event_id
+                FROM events e
+                WHERE e.room_id = ?
+                ORDER BY e.stream_ordering DESC
+                LIMIT 1000
+            """
+            txn.execute(sql, (room_id,))
+            candidate_event_ids = {row[0] for row in txn.fetchall()}
+
+            # Get the JSON for these recent events to extract their prev_events
+            sql = """
+                SELECT ej.event_id, ej.json
+                FROM event_json ej
+                WHERE ej.event_id = ANY(?)
+            """ if self._store.database_engine.supports_using_any_list else """
+                SELECT ej.event_id, ej.json
+                FROM event_json ej
+                JOIN events e ON e.event_id = ej.event_id
+                WHERE e.room_id = ?
+                ORDER BY e.stream_ordering DESC
+                LIMIT 1000
+            """
+
+            if self._store.database_engine.supports_using_any_list:
+                txn.execute(sql, (list(candidate_event_ids),))
+            else:
+                txn.execute(sql, (room_id,))
+
+            # Find which candidate events are referenced in prev_events
+            referenced_events = set()
+            for event_id, json_str in txn.fetchall():
+                try:
+                    import json
+                    event_json = json.loads(json_str)
+                    prev_events = event_json.get("prev_events", [])
+
+                    # prev_events can be either ["$event_id"] or [["$event_id", {}]]
+                    for prev in prev_events:
+                        if isinstance(prev, list):
+                            referenced_events.add(prev[0])
+                        else:
+                            referenced_events.add(prev)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to parse prev_events from event %s: %s",
+                        event_id,
+                        e
+                    )
+
+            # Forward extremities are candidates NOT referenced in anyone's prev_events
+            new_extremities = candidate_event_ids - referenced_events
+
+            if not new_extremities:
+                logger.warning(
+                    "No forward extremities found for room %s after recalculation. "
+                    "This might indicate an issue with the event DAG.",
+                    room_id
+                )
+                return
+
+            logger.info(
+                "Found %d forward extremities for room %s: %s",
+                len(new_extremities),
+                room_id,
+                new_extremities
+            )
+
+            # Delete existing forward extremities
+            self._store.db_pool.simple_delete_txn(
+                txn,
+                table="event_forward_extremities",
+                keyvalues={"room_id": room_id}
+            )
+
+            # Insert new forward extremities
+            self._store.db_pool.simple_insert_many_txn(
+                txn,
+                table="event_forward_extremities",
+                keys=("event_id", "room_id"),
+                values=[(event_id, room_id) for event_id in new_extremities]
+            )
+
+            # Invalidate get_latest_event_ids_in_room cache
+            self._store._invalidate_cache_and_stream(
+                txn,
+                self._store.get_latest_event_ids_in_room,
+                (room_id,)
+            )
+
+        await self._store.db_pool.runInteraction(
+            "recalculate_forward_extremities",
+            _recalculate_forward_extremities_txn
+        )
 
     async def _prepare_event_dict(
         self, room_id: str, event_dict: JsonDict, room_version, state_map: Dict[Tuple[str, str], str]

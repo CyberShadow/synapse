@@ -2315,6 +2315,32 @@ root:
 
             assert membership == "join", f"Expected 'join' membership, got {membership}"
 
+            # Verify forward extremities are correct (should be latest event, not create event)
+            print("\nChecking forward extremities...")
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            cursor.execute("""
+                SELECT efe.event_id, e.type, e.depth
+                FROM event_forward_extremities efe
+                JOIN events e ON e.event_id = efe.event_id
+                WHERE efe.room_id = ?
+                ORDER BY e.depth DESC
+            """, (room_id,))
+
+            extremities = cursor.fetchall()
+            conn.close()
+
+            print(f"Found {len(extremities)} forward extremities:")
+            for ext_id, ext_type, ext_depth in extremities:
+                print(f"  - {ext_id} (type={ext_type}, depth={ext_depth})")
+
+            # Forward extremity should NOT be the create event (depth 1)
+            # It should be one of the latest events in the room
+            assert len(extremities) > 0, "Should have at least one forward extremity"
+            assert all(depth > 1 for _, _, depth in extremities), \
+                "Forward extremities should not be the create event (depth 1)"
+
             # Also verify via API that user can access the room
             print("\nVerifying via API...")
             messages = self.get_room_messages(room_id)
