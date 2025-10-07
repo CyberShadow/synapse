@@ -2210,6 +2210,35 @@ root:
             print(f"\nTest files left in: {self.temp_dir}")
 
 
+    def get_events_from_database(self, room_id: str) -> list:
+        """Get complete events directly from the database (not via API).
+
+        This returns full PDUs with auth_events, hashes, signatures - just like
+        federation data, not stripped-down Client API responses.
+        """
+        print(f"Fetching events from database for room {room_id}")
+
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        # Get all events for the room with their complete JSON
+        cursor.execute("""
+            SELECT ej.json
+            FROM event_json ej
+            JOIN events e ON e.event_id = ej.event_id
+            WHERE e.room_id = ?
+            ORDER BY e.stream_ordering ASC
+        """, (room_id,))
+
+        events = []
+        for row in cursor.fetchall():
+            event_json = json.loads(row[0])
+            events.append(event_json)
+
+        conn.close()
+        print(f"Fetched {len(events)} complete events from database")
+        return events
+
     def test_current_state_updated_after_injection(self):
         """Test that current_state_events is updated after bulk injection.
 
@@ -2231,9 +2260,10 @@ root:
             # Send a message
             msg1 = self.send_message(room_id, "Test message")
 
-            # Export all room events
-            all_events = self.get_all_room_events(room_id)
-            print(f"Exported {len(all_events)} events from room")
+            # Export all room events DIRECTLY FROM DATABASE (complete PDUs)
+            # This gives us events with auth_events, hashes, signatures - like federation data
+            all_events = self.get_events_from_database(room_id)
+            print(f"Exported {len(all_events)} complete events from database")
 
             # Stop and delete database
             self.stop_synapse()
