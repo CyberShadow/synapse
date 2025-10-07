@@ -1318,6 +1318,18 @@ class BulkEventInjectionServlet(RestServlet):
 
         for event in events_to_process:
             try:
+                # Check if event already exists (for idempotent re-uploads)
+                # This avoids "No forward extremities left" errors and database inconsistency
+                existing_event = await self._store.get_event(event.event_id, allow_none=True)
+                if existing_event:
+                    logger.info(
+                        "Event %s already exists in room %s, skipping (idempotent re-upload)",
+                        event.event_id,
+                        room_id
+                    )
+                    successfully_processed += 1
+                    continue
+
                 # Compute context BEFORE persisting
                 # This allows state resolution to see previously persisted events
                 context = await self._state_handler.compute_event_context(event)
