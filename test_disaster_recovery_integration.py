@@ -2091,6 +2091,8 @@ root:
 
             # v1/v2 events use reference hash format event IDs
             # Format: $<base64-hash>:<server>
+            # Even though v1/v2 are not content-addressable, federation PDUs still include
+            # all the cryptographic fields (auth_events, prev_events, depth, hashes, signatures)
             create_event = {
                 "event_id": "$create12345abcdef:localhost",
                 "type": "m.room.create",
@@ -2102,6 +2104,12 @@ root:
                     # NO room_version field - this is room version 1
                 },
                 "origin_server_ts": ts,
+                # Complete PDU fields (arbitrary values for v1 since ID is not content-addressable)
+                "auth_events": [],
+                "prev_events": [],
+                "depth": 1,
+                "hashes": {"sha256": "dummycreatehash123"},
+                "signatures": {"localhost": {"ed25519:1": "dummycreatesig123"}},
             }
 
             message_event = {
@@ -2111,6 +2119,12 @@ root:
                 "room_id": room_id,
                 "content": {"msgtype": "m.text", "body": "Test message in v1 room"},
                 "origin_server_ts": ts + 1000,
+                # Complete PDU fields (arbitrary values for v1 since ID is not content-addressable)
+                "auth_events": [["$create12345abcdef:localhost", {}]],
+                "prev_events": [["$create12345abcdef:localhost", {}]],
+                "depth": 2,
+                "hashes": {"sha256": "dummymessagehash456"},
+                "signatures": {"localhost": {"ed25519:1": "dummymessagesig456"}},
             }
 
             print("\nUploading room version 1 events (no room_version in create event)...")

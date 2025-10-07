@@ -1242,18 +1242,26 @@ class BulkEventInjectionServlet(RestServlet):
                 actual_event_id = event.event_id
 
                 if original_event_id != actual_event_id:
-                    raise SynapseError(
-                        400,
-                        f"Event ID mismatch: provided event_id {original_event_id} "
-                        f"but calculated event_id is {actual_event_id}. "
-                        f"For room version {room_version.identifier}, event IDs are content-addressable "
-                        f"and calculated from the event content. This mismatch indicates the provided "
-                        f"cryptographic data (hashes/signatures/auth_events/prev_events) does not match "
-                        f"the event content. Ensure you're using complete events from federation or "
-                        f"database exports, NOT client API endpoints. Rejecting to prevent "
-                        f"federation desynchronization.",
-                        Codes.BAD_JSON
-                    )
+                    # For room v3+, event IDs are content-addressable
+                    # For room v1/v2, event IDs are part of the event structure
+                    if room_version.event_format >= EventFormatVersions.ROOM_V3:
+                        error_msg = (
+                            f"Event ID mismatch: provided event_id {original_event_id} "
+                            f"but calculated event_id is {actual_event_id}. "
+                            f"For room version {room_version.identifier}, event IDs are content-addressable "
+                            f"and calculated from the event content. This mismatch indicates the provided "
+                            f"cryptographic data (hashes/signatures/auth_events/prev_events) does not match "
+                            f"the event content. Ensure you're using complete events from federation or "
+                            f"database exports, NOT client API endpoints. Rejecting to prevent "
+                            f"federation desynchronization."
+                        )
+                    else:
+                        error_msg = (
+                            f"Event ID mismatch: provided event_id {original_event_id} "
+                            f"but got event_id {actual_event_id} after event creation. "
+                            f"For room version {room_version.identifier}, event IDs should be preserved as-is."
+                        )
+                    raise SynapseError(400, error_msg, Codes.BAD_JSON)
 
                 logger.info(
                     "Event ID validated: %s",
@@ -1551,32 +1559,20 @@ class BulkEventInjectionServlet(RestServlet):
         event_dict = dict(event_dict)
 
         # Validate required fields for disaster recovery
-        required = ["type", "sender", "content", "origin_server_ts", "room_id", "event_id"]
+        # All these fields are required by federation PDU format for ALL room versions
+        required = ["type", "sender", "content", "origin_server_ts", "room_id", "event_id",
+                    "auth_events", "prev_events", "depth", "hashes", "signatures"]
         missing = [f for f in required if f not in event_dict]
         if missing:
             raise SynapseError(
                 400,
                 f"Incomplete event data - missing required fields: {missing}. "
-                f"For disaster recovery, all events must include: type, sender, content, "
-                f"origin_server_ts, room_id, event_id, auth_events, prev_events, depth, "
-                f"hashes, and signatures. Use federation or database exports as data sources.",
+                f"For disaster recovery, all events must include complete PDU data: "
+                f"{', '.join(required)}. "
+                f"Use federation or database exports as data sources, "
+                f"NOT client API endpoints (/messages, /sync) which lack these fields.",
                 Codes.BAD_JSON
             )
-
-        # Validate cryptographic fields for room v3+
-        if room_version.event_format >= EventFormatVersions.ROOM_V3:
-            crypto_fields = ["auth_events", "prev_events", "depth", "hashes", "signatures"]
-            missing_crypto = [f for f in crypto_fields if f not in event_dict]
-            if missing_crypto:
-                raise SynapseError(
-                    400,
-                    f"Incomplete event data - missing cryptographic fields: {missing_crypto}. "
-                    f"For room version {room_version.identifier} (v3+), event IDs are content-addressable "
-                    f"and require complete event data including auth_events, prev_events, depth, "
-                    f"hashes, and signatures. Use federation or database exports as data sources, "
-                    f"NOT client API endpoints (/messages, /sync) which lack these fields.",
-                    Codes.BAD_JSON
-                )
 
         # Convert format if needed (v3+ uses simple lists, not tuples)
         if room_version.event_format >= EventFormatVersions.ROOM_V3:
@@ -1586,12 +1582,13 @@ class BulkEventInjectionServlet(RestServlet):
             if event_dict.get("prev_events") and isinstance(event_dict["prev_events"][0], (list, tuple)):
                 event_dict["prev_events"] = [e[0] for e in event_dict["prev_events"]]
 
-        # Remove event_id before event creation (required by FrozenEventV2 assertion)
-        # For room v3+, event IDs are content-addressable - they're calculated from
-        # the event's content. If the provided data is complete (including hashes,
-        # signatures), the recalculated ID will match the original. This is validated
-        # after event creation to ensure no desynchronization occurs.
-        event_dict.pop("event_id", None)
+            # Remove event_id before event creation (required by FrozenEventV2 assertion)
+            # For room v3+, event IDs are content-addressable - they're calculated from
+            # the event's content. If the provided data is complete (including hashes,
+            # signatures), the recalculated ID will match the original. This is validated
+            # after event creation to ensure no desynchronization occurs.
+            event_dict.pop("event_id", None)
+        # For room v1/v2, keep event_id in the dict (it's part of the event structure)
 
         return event_dict
 
