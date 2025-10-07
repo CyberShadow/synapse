@@ -55,19 +55,37 @@ This ensures that:
 - `room_id` - Room ID
 - `state_key` - (for state events)
 
-### For Partial Recovery (ID changes expected)
-**Minimum fields** (IDs will change, mapping provided):
-- `type`, `sender`, `content`, `origin_server_ts`, `room_id`
-- API auto-populates: `auth_events`, `prev_events`, `depth`
+### ~~For Partial Recovery~~ (NO LONGER SUPPORTED)
+**Incomplete events are now rejected.** The bulk injection API requires complete events
+to ensure event ID preservation and prevent federation desynchronization. Use federation
+or database exports as data sources, NOT client API endpoints.
 
 ## Technical Details
 
 ### Federation Behavior (Room v3+)
 
-Federation does NOT include event_id in PDUs for room v3+ rooms:
+**Federation PDUs include ALL cryptographic fields needed for event ID calculation.**
+
+Per Matrix Spec (server-server-api):
+- `pdu_v6.yaml` (room versions 4-10): Defines required PDU fields
+  - Reference: `data/api/server-server/definitions/pdu_v6.yaml`
+- `pdu_base.yaml`: Required fields include `hashes`, `signatures`, `depth`
+  - Reference: `data/api/server-server/definitions/components/pdu_base.yaml` (lines 67-74)
+- `auth_events_prev_events_v4.yaml`: Required fields include `auth_events`, `prev_events`
+  - Reference: `data/api/server-server/definitions/components/auth_events_prev_events_v4.yaml` (lines 43-45)
+
+**Required fields in Federation PDUs:**
+- ✅ `sender`, `origin_server_ts`, `type`, `content` (base fields)
+- ✅ `depth` (required per pdu_base.yaml line 72)
+- ✅ `hashes` (required per pdu_base.yaml line 73)
+- ✅ `signatures` (required per pdu_base.yaml line 74)
+- ✅ `auth_events` (required per auth_events_prev_events_v4.yaml line 44)
+- ✅ `prev_events` (required per auth_events_prev_events_v4.yaml line 45)
+
+**Event ID handling:**
 - Room v1/v2: `event_id` is included in the PDU and trusted
 - Room v3+: `event_id` is NOT in the wire format, calculated locally from content hash
-- Receivers independently calculate the ID and use that
+- Receivers independently calculate the ID from the complete PDU data
 
 ### Event ID Calculation Process
 
@@ -128,9 +146,18 @@ From `prune_event_dict` in events/utils.py:
 
 ### Data Source Requirements:
 
-The fields needed to preserve event IDs for room v3+ are:
-- ✅ **Database exports** (event_json table): Contains complete data including hashes/signatures
-- ✅ **Federation sources**: Includes all internal fields needed for ID calculation
-- ❌ **Client API** (`/messages`, `/sync`): Only user-visible fields, missing auth_events/prev_events/depth/hashes/signatures
+**Supported data sources (complete events with all required fields):**
+- ✅ **Database exports** (`event_json` table): Contains complete PDU data including hashes/signatures
+  - Synapse stores complete PDUs in `event_json.json` column
+  - For room v3+, `event_id` may not be in JSON (stored in `events.event_id`)
+- ✅ **Federation sources** (server-server API): PDUs include ALL required fields per spec
+  - See Matrix Spec references above - federation MUST include complete PDU data
+  - This includes: auth_events, prev_events, depth, hashes, signatures
 
-**Current implementation**: The bulk injection API accepts events from any source. With complete data (database/federation), IDs are preserved. With partial data (client API), IDs change and a mapping is returned.
+**Unsupported data sources (incomplete events, missing required fields):**
+- ❌ **Client API** (`/messages`, `/sync`): Only user-visible fields
+  - Missing: `auth_events`, `prev_events`, `depth`, `hashes`, `signatures`
+  - Reference: Client-Server API spec does not include these fields in event format
+  - Cannot preserve event IDs without complete cryptographic data
+
+**Current implementation (as of latest commit)**: The bulk injection API REQUIRES complete events. Incomplete events are rejected with a clear error message explaining data source requirements. This ensures event ID preservation and prevents federation desynchronization.
