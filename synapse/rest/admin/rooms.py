@@ -1603,31 +1603,34 @@ class BulkEventInjectionServlet(RestServlet):
             return event_dict
 
         # Normal mode - auto-populate missing fields
-        # Auto-populate auth_events if missing or empty
-        # EXCEPT for create events which don't have auth events
-        if not event_dict.get("auth_events") and event_dict["type"] != EventTypes.Create:
-            auth_event_ids = await self._get_auth_events_for_event(
-                room_id,
-                event_dict["type"],
-                event_dict.get("state_key"),
-                event_dict["sender"],
-                state_map
-            )
-            # Use correct format based on room version
-            if room_version.event_format >= EventFormatVersions.ROOM_V3:
-                # v3+ uses simple list
-                event_dict["auth_events"] = auth_event_ids
-            else:
-                # v1/v2 uses tuples format: [[event_id, {}], ...]
-                event_dict["auth_events"] = [[event_id, {}] for event_id in auth_event_ids]
-        elif event_dict["type"] == EventTypes.Create:
-            # Create events have no auth events AND no prev events
-            # This is a fundamental Matrix invariant - create event is the root of the DAG
+
+        # Handle create events first - they have no auth_events or prev_events
+        # This is a fundamental Matrix invariant - create event is the root of the DAG
+        if event_dict["type"] == EventTypes.Create:
             event_dict["auth_events"] = []
             event_dict["prev_events"] = []
+        else:
+            # Auto-populate auth_events if missing (but not if explicitly set to [])
+            # This supports minimal events (federation recovery) while preserving complete events
+            if "auth_events" not in event_dict:
+                auth_event_ids = await self._get_auth_events_for_event(
+                    room_id,
+                    event_dict["type"],
+                    event_dict.get("state_key"),
+                    event_dict["sender"],
+                    state_map
+                )
+                # Use correct format based on room version
+                if room_version.event_format >= EventFormatVersions.ROOM_V3:
+                    # v3+ uses simple list
+                    event_dict["auth_events"] = auth_event_ids
+                else:
+                    # v1/v2 uses tuples format: [[event_id, {}], ...]
+                    event_dict["auth_events"] = [[event_id, {}] for event_id in auth_event_ids]
 
-        # Auto-populate prev_events if missing or empty (but not for create events - handled above)
-        if not event_dict.get("prev_events") and event_dict["type"] != EventTypes.Create:
+        # Auto-populate prev_events if missing (but not if explicitly set to [])
+        # This supports minimal events (federation recovery) while preserving complete events
+        if "prev_events" not in event_dict:
             # Get latest events in the room
             latest_event_ids = await self._store.get_latest_event_ids_in_room(room_id)
             # Use correct format based on room version
