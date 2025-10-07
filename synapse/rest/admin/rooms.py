@@ -1621,11 +1621,13 @@ class BulkEventInjectionServlet(RestServlet):
                 # v1/v2 uses tuples format: [[event_id, {}], ...]
                 event_dict["auth_events"] = [[event_id, {}] for event_id in auth_event_ids]
         elif event_dict["type"] == EventTypes.Create:
-            # Create events have no auth events
+            # Create events have no auth events AND no prev events
+            # This is a fundamental Matrix invariant - create event is the root of the DAG
             event_dict["auth_events"] = []
+            event_dict["prev_events"] = []
 
-        # Auto-populate prev_events if missing or empty
-        if not event_dict.get("prev_events"):
+        # Auto-populate prev_events if missing or empty (but not for create events - handled above)
+        if not event_dict.get("prev_events") and event_dict["type"] != EventTypes.Create:
             # Get latest events in the room
             latest_event_ids = await self._store.get_latest_event_ids_in_room(room_id)
             # Use correct format based on room version
