@@ -1194,14 +1194,17 @@ class BulkEventInjectionServlet(RestServlet):
         self, room_id: str, events_data: List[JsonDict]
     ) -> Tuple[int, int, List[JsonDict], Dict[str, str]]:
         """Process events for a single room using existing Synapse code."""
-        
+
         # Get room version
         room_version = await self._store.get_room_version(room_id)
-        
+
         # Convert to EventBase objects
+        # Note: We pass an empty state_map initially since room doesn't exist yet
+        # Events will be processed sequentially and state will be queried from DB as we go
         events = []
         errors = []
         event_id_mapping = {}
+        state_map: Dict[Tuple[str, str], str] = {}  # Empty initially
         
         for idx, event_dict in enumerate(events_data):
             try:
@@ -1214,7 +1217,7 @@ class BulkEventInjectionServlet(RestServlet):
                 
                 # Auto-populate missing fields
                 event_dict = await self._prepare_event_dict(
-                    room_id, event_dict, room_version
+                    room_id, event_dict, room_version, state_map
                 )
                 
                 # The format checking is now done in _prepare_event_dict
@@ -1289,45 +1292,47 @@ class BulkEventInjectionServlet(RestServlet):
         if not events:
             return 0, len(events_data), errors, event_id_mapping
 
-        # Sort by depth for correct processing order
-        events.sort(key=lambda e: (e.depth, e.origin_server_ts))
+        # Sort events with create event absolutely first, then by depth
+        # This is critical: state resolution requires the create event to exist
+        def event_sort_key(event):
+            # Create events always first (is_create = True sorts before False)
+            is_create = event.type == EventTypes.Create
+            # Then by depth, then timestamp
+            return (not is_create, event.depth, event.origin_server_ts)
 
-        # Process create event first if it exists
-        create_event = None
-        other_events = []
-        for event in events:
-            if event.type == EventTypes.Create:
-                create_event = event
-            else:
-                other_events.append(event)
-                
+        events.sort(key=event_sort_key)
+
+        logger.info(
+            "Processing %d events for room %s (first event: %s)",
+            len(events),
+            room_id,
+            events[0].type if events else "none"
+        )
+
         # Process events using federation handler
         # This handles all the complexity of state resolution, persistence, etc.
+        # CRITICAL: Process events SEQUENTIALLY, not in batches
+        # State resolution for later events depends on earlier events (especially create) being persisted first
         successfully_processed = 0
-        
-        # Process create event first
-        if create_event:
-            events_to_process = [create_event] + other_events
-        else:
-            events_to_process = other_events
-            
+        events_to_process = events
+
         for event in events_to_process:
             try:
-                # Use the federation handler's event processing
-                # This automatically handles:
-                # - Auth validation
-                # - State resolution
-                # - Database persistence
-                # - Notifier updates
-                # - Cache invalidation
+                # Compute context BEFORE persisting
+                # This allows state resolution to see previously persisted events
                 context = await self._state_handler.compute_event_context(event)
-                
+
+                # Persist ONE event at a time to ensure sequential processing
+                # This is critical for disaster recovery where we're rebuilding room state from scratch
                 await self._federation_event_handler.persist_events_and_notify(
                     room_id,
                     [(event, context)],
                     backfilled=False  # Use positive stream ordering for visibility
                 )
-                
+
+                # IMPORTANT: Wait for persistence to complete before processing next event
+                # This ensures the create event is fully visible before processing dependent events
+
                 successfully_processed += 1
                 logger.debug("Successfully processed event %s", event.event_id)
                 
@@ -1370,15 +1375,42 @@ class BulkEventInjectionServlet(RestServlet):
             failed_count
         )
 
+        # CRITICAL: Rebuild current_state_events from the imported events
+        # This is necessary because bulk injection doesn't automatically update current state
+        if successfully_processed > 0:
+            try:
+                logger.info(
+                    "Rebuilding current_state_events for room %s after bulk injection",
+                    room_id
+                )
+                await self._storage_controllers.persistence.update_current_state(room_id)
+                logger.info(
+                    "Successfully rebuilt current_state_events for room %s",
+                    room_id
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to rebuild current_state_events for room %s: %s",
+                    room_id,
+                    e,
+                    exc_info=True
+                )
+
         return successfully_processed, failed_count, errors, event_id_mapping
 
     async def _prepare_event_dict(
-        self, room_id: str, event_dict: JsonDict, room_version
+        self, room_id: str, event_dict: JsonDict, room_version, state_map: Dict[Tuple[str, str], str]
     ) -> JsonDict:
         """Prepare event dict by auto-populating missing fields.
-        
+
         For disaster recovery, we need to be careful to preserve fields
         that affect the event ID calculation, especially for room v3+.
+
+        Args:
+            room_id: The room ID
+            event_dict: The event dictionary to prepare
+            room_version: The room version
+            state_map: Map of (type, state_key) -> event_id for tracking state during import
         """
         # Make a copy to avoid modifying the original
         event_dict = dict(event_dict)
@@ -1432,12 +1464,14 @@ class BulkEventInjectionServlet(RestServlet):
 
         # Normal mode - auto-populate missing fields
         # Auto-populate auth_events if missing or empty
-        if not event_dict.get("auth_events"):
+        # EXCEPT for create events which don't have auth events
+        if not event_dict.get("auth_events") and event_dict["type"] != EventTypes.Create:
             auth_event_ids = await self._get_auth_events_for_event(
                 room_id,
                 event_dict["type"],
                 event_dict.get("state_key"),
-                event_dict["sender"]
+                event_dict["sender"],
+                state_map
             )
             # Use correct format based on room version
             if room_version.event_format >= EventFormatVersions.ROOM_V3:
@@ -1446,6 +1480,9 @@ class BulkEventInjectionServlet(RestServlet):
             else:
                 # v1/v2 uses tuples format: [[event_id, {}], ...]
                 event_dict["auth_events"] = [[event_id, {}] for event_id in auth_event_ids]
+        elif event_dict["type"] == EventTypes.Create:
+            # Create events have no auth events
+            event_dict["auth_events"] = []
 
         # Auto-populate prev_events if missing or empty
         if not event_dict.get("prev_events"):
@@ -1498,42 +1535,59 @@ class BulkEventInjectionServlet(RestServlet):
         room_id: str,
         event_type: str,
         state_key: Optional[str],
-        sender: str
+        sender: str,
+        state_map: Dict[Tuple[str, str], str]
     ) -> List[str]:
-        """Get required auth events for an event type."""
-        
-        # Get current state
-        state_ids = await self._storage_controllers.state.get_current_state_ids(
-            room_id
-        )
-        
+        """Get required auth events for an event type.
+
+        Args:
+            room_id: The room ID
+            event_type: The event type
+            state_key: The state key (None for non-state events)
+            sender: The event sender
+            state_map: Current state map from bulk import (used for disaster recovery)
+
+        Returns:
+            List of auth event IDs
+        """
+
+        # Try to get state from state_map first (for disaster recovery)
+        # Fall back to database query if state_map is empty (normal operation)
+        if state_map:
+            state_ids = state_map
+        else:
+            # Get current state from database
+            state_ids = await self._storage_controllers.state.get_current_state_ids(
+                room_id
+            )
+
         auth_event_ids = []
-        
+
         # Always need create event
         create_id = state_ids.get((EventTypes.Create, ""))
         if create_id:
             auth_event_ids.append(create_id)
-        
+
         # Always need sender's membership
         sender_member = state_ids.get((EventTypes.Member, sender))
         if sender_member:
             auth_event_ids.append(sender_member)
-        
+
         # Always need power levels
         power_levels = state_ids.get((EventTypes.PowerLevels, ""))
         if power_levels:
             auth_event_ids.append(power_levels)
-        
+
         # For member events, need join rules
         if event_type == EventTypes.Member:
             join_rules = state_ids.get((EventTypes.JoinRules, ""))
             if join_rules:
                 auth_event_ids.append(join_rules)
-        
+
         # For state events, might need the previous state
         if state_key is not None:
             prev_state = state_ids.get((event_type, state_key))
             if prev_state and prev_state not in auth_event_ids:
                 auth_event_ids.append(prev_state)
-        
+
         return auth_event_ids

@@ -2210,6 +2210,95 @@ root:
             print(f"\nTest files left in: {self.temp_dir}")
 
 
+    def test_current_state_updated_after_injection(self):
+        """Test that current_state_events is updated after bulk injection.
+
+        This test verifies the bug where events are imported but current_state_events
+        is not updated, causing rooms to show as invite-only when user has joined.
+        """
+        print("\n=== TEST: Current State Updated After Injection ===")
+
+        try:
+            # Setup
+            self.setup()
+            self.start_synapse()
+            self.register_user()  # admin
+
+            # Create room
+            print("Creating room...")
+            room_id = self.create_room()
+
+            # Send a message
+            msg1 = self.send_message(room_id, "Test message")
+
+            # Export all room events
+            all_events = self.get_all_room_events(room_id)
+            print(f"Exported {len(all_events)} events from room")
+
+            # Stop and delete database
+            self.stop_synapse()
+            os.remove(self.db_path)
+
+            # Start fresh Synapse
+            print("\nStarting fresh Synapse instance...")
+            self._create_config()  # Recreate config
+            self.start_synapse()
+            self.register_user()  # Register admin again
+
+            # Inject all events to recreate the room
+            print(f"\nInjecting {len(all_events)} events...")
+            response = self.inject_room_events(room_id, all_events)
+            print(f"Injection response: {response}")
+
+            assert response["injected_events"] > 0, "Should have injected events"
+
+            # Wait for processing
+            time.sleep(1)
+
+            # Query database directly for current_state_events
+            print("\nChecking current_state_events table...")
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            # Check if m.room.member event for admin exists in current state
+            cursor.execute("""
+                SELECT cse.event_id, e.sender, ej.json
+                FROM current_state_events cse
+                JOIN events e ON e.event_id = cse.event_id
+                JOIN event_json ej ON ej.event_id = cse.event_id
+                WHERE cse.room_id = ?
+                  AND cse.type = 'm.room.member'
+                  AND cse.state_key = ?
+            """, (room_id, self.user_id))
+
+            row = cursor.fetchone()
+            conn.close()
+
+            assert row is not None, f"current_state_events should have membership event for {self.user_id}"
+            event_id, sender, event_json = row
+            print(f"Found membership event in current_state_events: {event_id}")
+
+            # Parse JSON and check membership
+            event_data = json.loads(event_json)
+            membership = event_data.get("content", {}).get("membership")
+            print(f"Current membership state: {membership}")
+
+            assert membership == "join", f"Expected 'join' membership, got {membership}"
+
+            # Also verify via API that user can access the room
+            print("\nVerifying via API...")
+            messages = self.get_room_messages(room_id)
+            message_bodies = [m.get("content", {}).get("body") for m in messages
+                            if m.get("type") == "m.room.message"]
+
+            assert "Test message" in message_bodies, "Should be able to read messages from room"
+
+            print("✓ Current state updated correctly after injection")
+
+        finally:
+            self.stop_synapse()
+            print(f"\nTest files left in: {self.temp_dir}")
+
     @staticmethod
     def run_all_tests():
         """Run all disaster recovery test scenarios with isolated test instances."""
@@ -2232,6 +2321,7 @@ root:
             ("Event ID Preservation", "test_event_id_preservation"),
             ("Error Reporting", "test_error_reporting"),
             ("Room Version 1", "test_room_version_1"),
+            ("Current State Updated After Injection", "test_current_state_updated_after_injection"),
         ]
 
         passed = 0
@@ -2298,11 +2388,13 @@ if __name__ == "__main__":
             test.test_error_reporting()
         elif test_name == "room-version-1":
             test.test_room_version_1()
+        elif test_name == "current-state":
+            test.test_current_state_updated_after_injection()
         elif test_name == "all":
             SynapseIntegrationTest.run_all_tests()
         else:
             print(f"Unknown test: {test_name}")
-            print("Available tests: basic, membership, timestamps, functionality, room-after-backup, minimal, missing-between, historical, encrypted, state-conflict, redaction, invite-only, event-id, error-reporting, room-version-1, all")
+            print("Available tests: basic, membership, timestamps, functionality, room-after-backup, minimal, missing-between, historical, encrypted, state-conflict, redaction, invite-only, event-id, error-reporting, room-version-1, current-state, all")
     else:
         # Default to running all tests
         SynapseIntegrationTest.run_all_tests()
