@@ -519,13 +519,20 @@ root:
             
             # For federation recovery simulation, remove auth_events and prev_events
             # The bulk injection API will automatically reconstruct them
-            print("\nSimulating federation recovery - removing auth_events and prev_events...")
+            # IMPORTANT: Also remove event_id because for room v3+, event IDs are
+            # content-addressable. If we auto-populate fields, the calculated ID
+            # will be different from the original, causing federation desync.
+            print("\nSimulating federation recovery - removing auth_events, prev_events, and event_id...")
             for event in messages_to_recover:
+                original_id = event.get('event_id', 'unknown')
                 # Remove fields that would be missing in federation recovery
                 event.pop("auth_events", None)
                 event.pop("prev_events", None)
                 event.pop("depth", None)
-                print(f"  Event {event['event_id']} stripped to basic fields")
+                event.pop("hashes", None)
+                event.pop("signatures", None)
+                event.pop("event_id", None)  # Must remove for room v3+ or ID will mismatch
+                print(f"  Event {original_id} stripped to basic fields")
             
             response = self.inject_room_events(room_id, messages_to_recover)
             print(f"\nInjection response: {response}")
@@ -958,11 +965,13 @@ root:
                 # Add state_key for state events
                 if "state_key" in event:
                     minimal["state_key"] = event["state_key"]
-                
-                # Event ID is required for injection
-                if "event_id" in event:
-                    minimal["event_id"] = event["event_id"]
-                    
+
+                # Do NOT include event_id for minimal events
+                # For room v3+, event IDs are content-addressable. If we don't provide
+                # complete cryptographic data (hashes, signatures, auth_events, prev_events),
+                # the server will auto-populate fields and calculate a different ID.
+                # This would cause "Event ID mismatch" errors with strict validation.
+
                 minimal_events.append(minimal)
             
             print(f"Created {len(minimal_events)} minimal events from {len(all_events)} full events")
@@ -2222,8 +2231,10 @@ root:
         cursor = conn.cursor()
 
         # Get all events for the room with their complete JSON
+        # IMPORTANT: event_json.json might not include event_id for room v3+,
+        # so we need to explicitly add it from the events table
         cursor.execute("""
-            SELECT ej.json
+            SELECT e.event_id, ej.json
             FROM event_json ej
             JOIN events e ON e.event_id = ej.event_id
             WHERE e.room_id = ?
@@ -2232,7 +2243,10 @@ root:
 
         events = []
         for row in cursor.fetchall():
-            event_json = json.loads(row[0])
+            event_id = row[0]
+            event_json = json.loads(row[1])
+            # Ensure event_id is included (required for disaster recovery)
+            event_json['event_id'] = event_id
             events.append(event_json)
 
         conn.close()

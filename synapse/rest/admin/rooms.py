@@ -1228,42 +1228,37 @@ class BulkEventInjectionServlet(RestServlet):
                 event = make_event_from_dict(event_dict, room_version)
                 logger.info("Created event %s", event.event_id)
 
-                # Validate event ID for disaster recovery mode
-                if original_event_id:
-                    actual_event_id = event.event_id
-
-                    # Check if this was a disaster recovery event (complete data provided)
-                    # For room v3+, if complete cryptographic data was provided, IDs must match
-                    was_complete_event = all(
-                        k in events_data[idx] for k in
-                        ["auth_events", "prev_events", "depth", "hashes", "signatures"]
+                # Validate event ID - MUST ALWAYS match for disaster recovery
+                # For room v3+, event IDs are content-addressable. If the provided
+                # cryptographic data is correct, the calculated ID will match.
+                if not original_event_id:
+                    raise SynapseError(
+                        400,
+                        "event_id is required for disaster recovery. "
+                        "Use federation or database exports as data sources.",
+                        Codes.BAD_JSON
                     )
 
-                    if was_complete_event and room_version.event_format >= 3:
-                        # This was a complete event with cryptographic data
-                        # The recalculated ID MUST match the original
-                        if original_event_id != actual_event_id:
-                            raise SynapseError(
-                                400,
-                                f"Event ID mismatch: provided complete event data with ID "
-                                f"{original_event_id} but calculated ID is {actual_event_id}. "
-                                f"This indicates the provided cryptographic data (hashes/signatures) "
-                                f"does not match the event content. Rejecting to prevent "
-                                f"federation desynchronization.",
-                                Codes.BAD_JSON
-                            )
-                        logger.info(
-                            "Event ID validated: %s (disaster recovery mode)",
-                            original_event_id
-                        )
-                    elif original_event_id != actual_event_id:
-                        # Incomplete event data - ID change is expected
-                        logger.info(
-                            "Event ID changed (expected for incomplete data): %s -> %s",
-                            original_event_id,
-                            actual_event_id
-                        )
-                        event_id_mapping[original_event_id] = actual_event_id
+                actual_event_id = event.event_id
+
+                if original_event_id != actual_event_id:
+                    raise SynapseError(
+                        400,
+                        f"Event ID mismatch: provided event_id {original_event_id} "
+                        f"but calculated event_id is {actual_event_id}. "
+                        f"For room version {room_version.identifier}, event IDs are content-addressable "
+                        f"and calculated from the event content. This mismatch indicates the provided "
+                        f"cryptographic data (hashes/signatures/auth_events/prev_events) does not match "
+                        f"the event content. Ensure you're using complete events from federation or "
+                        f"database exports, NOT client API endpoints. Rejecting to prevent "
+                        f"federation desynchronization.",
+                        Codes.BAD_JSON
+                    )
+
+                logger.info(
+                    "Event ID validated: %s",
+                    original_event_id
+                )
 
                 events.append(event)
                     
@@ -1541,137 +1536,62 @@ class BulkEventInjectionServlet(RestServlet):
     async def _prepare_event_dict(
         self, room_id: str, event_dict: JsonDict, room_version, state_map: Dict[Tuple[str, str], str]
     ) -> JsonDict:
-        """Prepare event dict by auto-populating missing fields.
+        """Prepare event dict for disaster recovery.
 
-        For disaster recovery, we need to be careful to preserve fields
-        that affect the event ID calculation, especially for room v3+.
+        For disaster recovery, we require COMPLETE events with all cryptographic data.
+        This ensures event IDs are preserved and federation consistency is maintained.
 
         Args:
             room_id: The room ID
-            event_dict: The event dictionary to prepare
+            event_dict: The event dictionary (must be complete)
             room_version: The room version
             state_map: Map of (type, state_key) -> event_id for tracking state during import
         """
         # Make a copy to avoid modifying the original
         event_dict = dict(event_dict)
-        
-        # Ensure required fields
-        required = ["type", "sender", "content", "origin_server_ts", "room_id"]
+
+        # Validate required fields for disaster recovery
+        required = ["type", "sender", "content", "origin_server_ts", "room_id", "event_id"]
         missing = [f for f in required if f not in event_dict]
         if missing:
-            raise ValueError(f"Missing required fields: {missing}")
-
-        # For disaster recovery with room v3+, check if we have an event_id
-        # and all fields needed to reproduce it
-        original_event_id = event_dict.get("event_id")
-        is_disaster_recovery = (
-            room_version.event_format >= 3 and 
-            original_event_id and
-            # These fields indicate this is a complete event from disaster recovery
-            all(field in event_dict for field in ["auth_events", "prev_events", "depth"])
-        )
-        
-        if is_disaster_recovery:
-            # This appears to be a complete event from disaster recovery
-            # We should preserve all fields to maintain the same event ID
-            logger.info(
-                "Disaster recovery mode for event %s - preserving all fields",
-                original_event_id
+            raise SynapseError(
+                400,
+                f"Incomplete event data - missing required fields: {missing}. "
+                f"For disaster recovery, all events must include: type, sender, content, "
+                f"origin_server_ts, room_id, event_id, auth_events, prev_events, depth, "
+                f"hashes, and signatures. Use federation or database exports as data sources.",
+                Codes.BAD_JSON
             )
-            
-            # For room v3+, we need to ensure the correct format
-            if room_version.event_format >= EventFormatVersions.ROOM_V3:
-                # v3+ uses simple lists, not tuples
-                if "auth_events" in event_dict and event_dict["auth_events"]:
-                    # Convert from tuples format to simple list if needed
-                    if isinstance(event_dict["auth_events"][0], (list, tuple)):
-                        event_dict["auth_events"] = [e[0] for e in event_dict["auth_events"]]
-                        logger.info("Converted auth_events from tuple format to list for v3+")
-                        
-                if "prev_events" in event_dict and event_dict["prev_events"]:
-                    # Convert from tuples format to simple list if needed
-                    if isinstance(event_dict["prev_events"][0], (list, tuple)):
-                        event_dict["prev_events"] = [e[0] for e in event_dict["prev_events"]]
-                        logger.info("Converted prev_events from tuple format to list for v3+")
-            
-            # Remove event_id before event creation (required by FrozenEventV2 assertion)
-            # For room v3+, event IDs are content-addressable - they're calculated from
-            # the event's content. If the provided data is complete (including hashes,
-            # signatures), the recalculated ID will match the original. This is validated
-            # after event creation to ensure no desynchronization occurs.
-            event_dict.pop("event_id", None)
-            return event_dict
 
-        # Normal mode - auto-populate missing fields
-
-        # Handle create events first - they have no auth_events or prev_events
-        # This is a fundamental Matrix invariant - create event is the root of the DAG
-        if event_dict["type"] == EventTypes.Create:
-            event_dict["auth_events"] = []
-            event_dict["prev_events"] = []
-        else:
-            # Auto-populate auth_events if missing (but not if explicitly set to [])
-            # This supports minimal events (federation recovery) while preserving complete events
-            if "auth_events" not in event_dict:
-                auth_event_ids = await self._get_auth_events_for_event(
-                    room_id,
-                    event_dict["type"],
-                    event_dict.get("state_key"),
-                    event_dict["sender"],
-                    state_map
-                )
-                # Use correct format based on room version
-                if room_version.event_format >= EventFormatVersions.ROOM_V3:
-                    # v3+ uses simple list
-                    event_dict["auth_events"] = auth_event_ids
-                else:
-                    # v1/v2 uses tuples format: [[event_id, {}], ...]
-                    event_dict["auth_events"] = [[event_id, {}] for event_id in auth_event_ids]
-
-        # Auto-populate prev_events if missing (but not if explicitly set to [])
-        # This supports minimal events (federation recovery) while preserving complete events
-        if "prev_events" not in event_dict:
-            # Get latest events in the room
-            latest_event_ids = await self._store.get_latest_event_ids_in_room(room_id)
-            # Use correct format based on room version
-            if room_version.event_format >= EventFormatVersions.ROOM_V3:
-                # v3+ uses simple list
-                event_dict["prev_events"] = list(latest_event_ids)
-            else:
-                # v1/v2 uses tuples format: [[event_id, {}], ...]
-                event_dict["prev_events"] = [[event_id, {}] for event_id in latest_event_ids]
-
-        # Auto-calculate depth if missing
-        if "depth" not in event_dict:
-            if event_dict["prev_events"]:
-                # Extract event IDs from tuples format if needed
-                prev_event_ids = []
-                for item in event_dict["prev_events"]:
-                    if isinstance(item, list) and len(item) >= 1:
-                        prev_event_ids.append(item[0])
-                    else:
-                        prev_event_ids.append(item)
-                        
-                # Get max depth of prev events
-                max_depth = await self._store.get_max_depth_of(prev_event_ids)
-                event_dict["depth"] = max_depth[1] + 1 if max_depth[1] is not None else 1
-            else:
-                event_dict["depth"] = 1
-
-        # Handle event_id based on room version
+        # Validate cryptographic fields for room v3+
         if room_version.event_format >= EventFormatVersions.ROOM_V3:
-            # For v3+, event_id MUST NOT be in dict (it's computed from content)
-            if "event_id" in event_dict:
-                event_dict.pop("event_id")
-        else:
-            # For v1/v2, event_id MUST be in dict
-            # We require it to be provided (from disaster recovery backup)
-            # to preserve original event IDs
-            if "event_id" not in event_dict:
-                raise ValueError(
-                    f"event_id is required for room version {room_version.identifier} events. "
-                    "For disaster recovery, event_id should be provided from the backup database."
+            crypto_fields = ["auth_events", "prev_events", "depth", "hashes", "signatures"]
+            missing_crypto = [f for f in crypto_fields if f not in event_dict]
+            if missing_crypto:
+                raise SynapseError(
+                    400,
+                    f"Incomplete event data - missing cryptographic fields: {missing_crypto}. "
+                    f"For room version {room_version.identifier} (v3+), event IDs are content-addressable "
+                    f"and require complete event data including auth_events, prev_events, depth, "
+                    f"hashes, and signatures. Use federation or database exports as data sources, "
+                    f"NOT client API endpoints (/messages, /sync) which lack these fields.",
+                    Codes.BAD_JSON
                 )
+
+        # Convert format if needed (v3+ uses simple lists, not tuples)
+        if room_version.event_format >= EventFormatVersions.ROOM_V3:
+            if event_dict.get("auth_events") and isinstance(event_dict["auth_events"][0], (list, tuple)):
+                event_dict["auth_events"] = [e[0] for e in event_dict["auth_events"]]
+
+            if event_dict.get("prev_events") and isinstance(event_dict["prev_events"][0], (list, tuple)):
+                event_dict["prev_events"] = [e[0] for e in event_dict["prev_events"]]
+
+        # Remove event_id before event creation (required by FrozenEventV2 assertion)
+        # For room v3+, event IDs are content-addressable - they're calculated from
+        # the event's content. If the provided data is complete (including hashes,
+        # signatures), the recalculated ID will match the original. This is validated
+        # after event creation to ensure no desynchronization occurs.
+        event_dict.pop("event_id", None)
 
         return event_dict
 
