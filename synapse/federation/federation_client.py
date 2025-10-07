@@ -939,10 +939,21 @@ class FederationClient(FederationBase):
                 502, f"Failed to {description} via any server: No servers specified."
             )
 
+        # Track all attempted servers and their outcomes for better error reporting
+        attempted_servers = []
+        last_error_detail = None
+
         for destination in destinations:
             # We don't want to ask our own server for information we don't have
             if self._is_mine_server_name(destination):
+                logger.debug(
+                    "Skipping local server %s for %s",
+                    destination,
+                    description
+                )
                 continue
+
+            attempted_servers.append(destination)
 
             try:
                 return await callback(destination)
@@ -950,13 +961,16 @@ class FederationClient(FederationBase):
                 RequestSendFailed,
                 InvalidResponseError,
             ) as e:
+                last_error_detail = f"Network error: {e}"
                 logger.warning("Failed to %s via %s: %s", description, destination, e)
                 # Skip to the next homeserver in the list to try.
                 continue
             except NotRetryingDestination as e:
+                last_error_detail = f"Not retrying: {e}"
                 logger.info("%s: %s", description, e)
                 continue
             except FederationDeniedError:
+                last_error_detail = "Federation denied"
                 logger.info(
                     "%s: Not attempting to %s from %s because the homeserver is not on our federation whitelist",
                     description,
@@ -987,8 +1001,20 @@ class FederationClient(FederationBase):
                     failover = True
 
                 if not failover:
+                    # Log detailed failure reason before raising
+                    logger.error(
+                        "Failed to %s via %s with non-retryable error: %i %s (errcode: %s). "
+                        "Not attempting other servers. Attempted: %s",
+                        description,
+                        destination,
+                        e.code,
+                        synapse_error.msg,
+                        synapse_error.errcode,
+                        attempted_servers,
+                    )
                     raise synapse_error from e
 
+                last_error_detail = f"HTTP {e.code}: {synapse_error.msg} ({synapse_error.errcode})"
                 logger.warning(
                     "Failed to %s via %s: %i %s",
                     description,
@@ -996,12 +1022,18 @@ class FederationClient(FederationBase):
                     e.code,
                     e.args[0],
                 )
-            except Exception:
+            except Exception as e:
+                last_error_detail = f"Unexpected error: {type(e).__name__}: {e}"
                 logger.warning(
                     "Failed to %s via %s", description, destination, exc_info=True
                 )
 
-        raise SynapseError(502, f"Failed to {description} via any server")
+        # If we get here, all servers failed
+        error_msg = f"Failed to {description} via any server. Attempted servers: {attempted_servers}"
+        if last_error_detail:
+            error_msg += f". Last error: {last_error_detail}"
+        logger.error(error_msg)
+        raise SynapseError(502, error_msg)
 
     async def make_membership_event(
         self,

@@ -1076,6 +1076,15 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
                 if inviter and not self.hs.is_mine(inviter):
                     remote_room_hosts.append(inviter.domain)
 
+                # Log remote join attempt details for debugging
+                logger.info(
+                    "Attempting remote join for %s to %s. Remote hosts to try: %s (inviter: %s)",
+                    target,
+                    room_id,
+                    remote_room_hosts,
+                    inviter.to_string() if inviter else "none"
+                )
+
                 content["membership"] = Membership.JOIN
 
                 try:
