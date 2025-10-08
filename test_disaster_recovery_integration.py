@@ -2309,6 +2309,176 @@ root:
             self.stop_synapse()
             print(f"\nTest files left in: {self.temp_dir}")
 
+    def test_invite_before_join_sliding_sync(self):
+        """Test bulk injection when invite is processed before join.
+
+        This reproduces the sliding sync assertion failure that occurred when
+        bulk injecting events where a local user receives an invite before
+        they join. The sequence is:
+        1. Room created by alice@matrix.org (remote user)
+        2. alice invites admin@localhost (local user)
+        3. admin@localhost joins
+
+        When bulk injecting into a fresh localhost server:
+        - Processing invite: server determines it's "not in room" (invite doesn't
+          count), sets no_longer_in_room=True, deletes current_state_events
+        - Processing join: server is now "in room" but state is empty, which
+          previously triggered an assertion error
+        """
+        print("\n=== TEST: Invite Before Join (Sliding Sync Fix) ===")
+
+        try:
+            # We'll construct events manually to simulate a federation scenario
+            # Room created by alice@matrix.org, who invites admin@localhost
+
+            # These are pre-computed complete events for room version 10
+            # Event IDs were computed by the server based on canonical JSON hashing
+            # (iterated until stable - event IDs depend on auth_events/prev_events references)
+            create_event_id = "$KUcvCrCAlTjTX9v7MHkUXhdjrbO8gXpz2a3kP0hOa4o"
+            invite_event_id = "$mg9TmWuZxwu03pZy3Jtr2FGpXPyumHQS1pMyD_vOb9A"
+            join_event_id = "$tGTLuHWJKeSJcSLO0H_q04nFEjzp7ZV34tTtQyghPPo"
+
+            events_to_inject = [
+                # Event 1: m.room.create by alice@matrix.org
+                {
+                    "auth_events": [],
+                    "content": {
+                        "creator": "@alice:matrix.org",
+                        "room_version": "10"
+                    },
+                    "depth": 1,
+                    "hashes": {
+                        "sha256": "placeholder"
+                    },
+                    "origin": "matrix.org",
+                    "origin_server_ts": 1600000000000,
+                    "prev_events": [],
+                    "room_id": "!test_room:matrix.org",
+                    "sender": "@alice:matrix.org",
+                    "state_key": "",
+                    "type": "m.room.create",
+                    "signatures": {
+                        "matrix.org": {
+                            "ed25519:auto": "placeholder"
+                        }
+                    },
+                    "event_id": create_event_id
+                },
+                # Event 2: m.room.member (invite) for admin@localhost by alice@matrix.org
+                {
+                    "auth_events": [create_event_id],
+                    "content": {
+                        "membership": "invite"
+                    },
+                    "depth": 2,
+                    "hashes": {
+                        "sha256": "placeholder"
+                    },
+                    "origin": "matrix.org",
+                    "origin_server_ts": 1600000001000,
+                    "prev_events": [create_event_id],
+                    "room_id": "!test_room:matrix.org",
+                    "sender": "@alice:matrix.org",
+                    "state_key": "@admin:localhost",
+                    "type": "m.room.member",
+                    "signatures": {
+                        "matrix.org": {
+                            "ed25519:auto": "placeholder"
+                        }
+                    },
+                    "event_id": invite_event_id
+                },
+                # Event 3: m.room.member (join) by admin@localhost
+                {
+                    "auth_events": [create_event_id, invite_event_id],
+                    "content": {
+                        "membership": "join"
+                    },
+                    "depth": 3,
+                    "hashes": {
+                        "sha256": "placeholder"
+                    },
+                    "origin": "localhost",
+                    "origin_server_ts": 1600000002000,
+                    "prev_events": [invite_event_id],
+                    "room_id": "!test_room:matrix.org",
+                    "sender": "@admin:localhost",
+                    "state_key": "@admin:localhost",
+                    "type": "m.room.member",
+                    "signatures": {
+                        "localhost": {
+                            "ed25519:auto": "placeholder"
+                        }
+                    },
+                    "event_id": join_event_id
+                }
+            ]
+
+            print(f"Prepared {len(events_to_inject)} events for injection")
+            print(f"Event IDs: create={create_event_id[:20]}..., invite={invite_event_id[:20]}..., join={join_event_id[:20]}...")
+
+            # Start fresh Synapse instance with server_name='localhost'
+            print("\nStarting fresh Synapse instance (server_name=localhost)...")
+            self.setup()
+            self.start_synapse()
+            self.register_user()  # Register admin@localhost ONLY
+
+            # alice@matrix.org is NOT registered - she's a remote user
+            # When processing events:
+            # 1. Create event: no local users in room yet
+            # 2. Invite event: admin@localhost invited but not joined, no_longer_in_room=True, deletes state
+            # 3. Join event: admin@localhost joins, but state is empty, no_longer_in_room=False
+            #    -> This triggers the bug!
+
+            room_id = "!test_room:matrix.org"
+
+            # Inject events - this should trigger the sliding sync assertion without the fix
+            print(f"\nInjecting {len(events_to_inject)} events...")
+            print("Expected: invite processed first (no_longer_in_room=True, deletes state)")
+            print("         then join processed (no_longer_in_room=False, empty state)")
+            response = self.inject_room_events(room_id, events_to_inject)
+            print(f"Injection response: {response}")
+
+            # If we get here without an assertion error, the fix worked!
+            assert response["injected_events"] > 0, "Should have injected events"
+            assert response["failed_events"] == 0, "Should have no failed events"
+
+            # Wait for processing
+            time.sleep(1)
+
+            # Verify room state is correct
+            print("\nVerifying room state...")
+
+            # Check current_state_events via database
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            # Admin should be in joined state
+            cursor.execute("""
+                SELECT cse.event_id, ej.json
+                FROM current_state_events cse
+                JOIN event_json ej ON ej.event_id = cse.event_id
+                WHERE cse.room_id = ?
+                  AND cse.type = 'm.room.member'
+                  AND cse.state_key = ?
+            """, (room_id, self.user_id))
+
+            row = cursor.fetchone()
+            assert row is not None, f"Should have membership event for {self.user_id}"
+
+            event_json = json.loads(row[1])
+            membership = event_json.get("content", {}).get("membership")
+            print(f"Admin's current membership: {membership}")
+            assert membership == "join", f"Admin should be joined, got {membership}"
+
+            conn.close()
+
+            print("✓ Invite-before-join test passed (sliding sync fix verified)")
+
+        finally:
+            self.stop_synapse()
+            print(f"\nTest files left in: {self.temp_dir}")
+
     @staticmethod
     def run_all_tests():
         """Run all disaster recovery test scenarios with isolated test instances."""
@@ -2332,6 +2502,7 @@ root:
             ("Error Reporting", "test_error_reporting"),
             ("Room Version 1", "test_room_version_1"),
             ("Current State Updated After Injection", "test_current_state_updated_after_injection"),
+            ("Invite Before Join (Sliding Sync)", "test_invite_before_join_sliding_sync"),
         ]
 
         passed = 0
@@ -2400,11 +2571,13 @@ if __name__ == "__main__":
             test.test_room_version_1()
         elif test_name == "current-state":
             test.test_current_state_updated_after_injection()
+        elif test_name == "invite-before-join":
+            test.test_invite_before_join_sliding_sync()
         elif test_name == "all":
             SynapseIntegrationTest.run_all_tests()
         else:
             print(f"Unknown test: {test_name}")
-            print("Available tests: basic, membership, timestamps, functionality, room-after-backup, minimal, missing-between, historical, encrypted, state-conflict, redaction, invite-only, event-id, error-reporting, room-version-1, current-state, all")
+            print("Available tests: basic, membership, timestamps, functionality, room-after-backup, minimal, missing-between, historical, encrypted, state-conflict, redaction, invite-only, event-id, error-reporting, room-version-1, current-state, invite-before-join, all")
     else:
         # Default to running all tests
         SynapseIntegrationTest.run_all_tests()

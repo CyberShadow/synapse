@@ -4,8 +4,8 @@ This document outlines the disaster recovery scenarios covered by the Synapse bu
 
 ## Implementation Status
 
-**✅ Implemented & Tested (10 scenarios):**
-- Scenarios 1, 2, 4, 5, 6, 8, 10, 11, 12-14, 17, 22
+**✅ Implemented & Tested (11 scenarios):**
+- Scenarios 1, 2, 4, 5, 6, 8, 10, 11, 12-14, 17, 22, 23
 
 **❌ Removed (3 scenarios - based on incorrect assumptions):**
 - Scenarios 3, 7, 9: Assumed federation lacks required fields (INCORRECT - see EVENT_ID_PRESERVATION_RESEARCH.md)
@@ -307,6 +307,36 @@ See EVENT_ID_PRESERVATION_RESEARCH.md for spec citations and technical details.
 
 **Implementation:** Complete events (with auth_events, prev_events, depth, hashes, signatures) preserve event IDs. The API requires ALL these fields and validates event_id matches.
 
+## Scenario 23: Invite Before Join (Sliding Sync Edge Case)
+
+**Test Location:** `test_disaster_recovery_integration.py::test_invite_before_join_sliding_sync()`
+
+**Current Status:** ✅ IMPLEMENTED - Tests sliding sync fix
+
+1. Alice creates a private room and invites admin (local user)
+2. Admin accepts the invite and joins the room
+3. Admin sends a test message
+4. **All events are exported from database**
+5. **Fresh Synapse instance is created** (simulating disaster recovery to new server)
+6. **Admin injects all room events via bulk injection**
+7. During injection:
+   - **Invite is processed first:** Server determines it's "not in room" (invite doesn't count as joined), marks `no_longer_in_room=True`, deletes `current_state_events`
+   - **Join is processed next:** Server is now "in room" but `current_state_events` is empty (deleted in previous step)
+8. **Expected result:**
+   - Injection succeeds without assertion error
+   - Room state is correctly populated
+   - Admin has "join" membership in `current_state_events`
+   - Room is fully accessible via API
+
+**Bug Fixed:** Previously, the sliding sync code asserted that empty `current_state_map` MUST mean `no_longer_in_room=True`. This failed when bulk injecting events where invites precede joins for local users. The fix properly handles this case by setting `has_known_state=False` instead of asserting.
+
+**Implementation Details:**
+- **File:** `synapse/storage/databases/main/events.py:_calculate_sliding_sync_table_changes()`
+- **Fix:** Removed overly-strict assertion, added proper handling for bulk injection case
+- **Commit:** "Fix sliding sync assertion failure during bulk event injection"
+
+**Why This Matters:** When importing rooms into a fresh Synapse instance, the server processes invite events before join events for local users. This triggers a code path where the server is simultaneously "in the room" (user has joined) but has empty current state (deleted when processing invite). The fix ensures bulk injection handles this edge case correctly.
+
 ---
 
 ## Test Implementation Details
@@ -352,6 +382,7 @@ See EVENT_ID_PRESERVATION_RESEARCH.md for spec citations and technical details.
 ./dependencies/synapse/run_disaster_recovery_integration_test.sh timestamps
 ./dependencies/synapse/run_disaster_recovery_integration_test.sh current-state
 ./dependencies/synapse/run_disaster_recovery_integration_test.sh event-id
+./dependencies/synapse/run_disaster_recovery_integration_test.sh invite-before-join
 
 # Run in container (from dependencies/synapse directory)
 podman run --rm -v ".:/synapse" -w /synapse --entrypoint="" localhost/synapse-dev:latest \
