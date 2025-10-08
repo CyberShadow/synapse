@@ -1496,6 +1496,37 @@ class BulkEventInjectionServlet(RestServlet):
                         successfully_processed += 1
                         continue
 
+                # CRITICAL: Before computing context, upgrade any outlier forward extremities
+                # Processing events can create NEW outlier extremities, so we check before each event
+                for upgrade_iteration in range(100):
+                    current_extremities = await self._store.get_forward_extremities_for_room(room_id)
+                    current_extremity_ids = {ext[0] for ext in current_extremities}
+
+                    outliers_found = []
+                    for ext_id in current_extremity_ids:
+                        ext_event = await self._store.get_event(ext_id, allow_none=True)
+                        if ext_event and ext_event.internal_metadata.is_outlier():
+                            outliers_found.append(ext_event)
+
+                    if not outliers_found:
+                        break
+
+                    logger.warning(
+                        "Before processing %s: found %d outlier extremities to upgrade: %s",
+                        event.event_id,
+                        len(outliers_found),
+                        [e.event_id for e in outliers_found]
+                    )
+
+                    for outlier_ext in outliers_found:
+                        logger.warning("Upgrading outlier extremity %s", outlier_ext.event_id)
+                        ext_context = await self._state_handler.compute_event_context(outlier_ext)
+                        await self._federation_event_handler.persist_events_and_notify(
+                            room_id,
+                            [(outlier_ext, ext_context)],
+                            backfilled=False
+                        )
+
                 # Compute context BEFORE persisting
                 # This allows state resolution to see previously persisted events
                 context = await self._state_handler.compute_event_context(event)
