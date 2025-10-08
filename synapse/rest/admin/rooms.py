@@ -1359,108 +1359,33 @@ class BulkEventInjectionServlet(RestServlet):
             events[0].type if events else "none"
         )
 
-        # CRITICAL: Before processing any events, upgrade ALL outlier forward extremities
-        # These must be processed FIRST to avoid KeyError during state resolution
-        # This handles the case where events from a snapshot are outliers and forward extremities
-        # We loop because upgrading extremities can reveal new extremities
-        event_ids_in_batch = {event.event_id for event in events}
-        total_upgraded = 0
-        max_iterations = 100  # Prevent infinite loops
-
-        for iteration in range(max_iterations):
-            # Get ALL forward extremities including outliers without state groups
-            # The old get_forward_extremities_for_room() uses INNER JOIN with event_to_state_groups
-            # which excludes outliers without state, causing KeyError
-            forward_extremity_ids = set(await self._store.get_all_forward_extremity_ids_for_room(room_id))
-
-            # Find ALL outlier forward extremities (whether in batch or not)
-            outlier_extremities_to_upgrade = []
-            for extremity_id in forward_extremity_ids:
-                extremity_event = await self._store.get_event(extremity_id, allow_none=True)
-                if extremity_event and extremity_event.internal_metadata.is_outlier():
-                    outlier_extremities_to_upgrade.append(extremity_event)
-
-            if not outlier_extremities_to_upgrade:
-                # No more outlier extremities to upgrade
-                if total_upgraded > 0:
-                    logger.warning(
-                        "Finished upgrading %d outlier forward extremities in %d iterations for room %s",
-                        total_upgraded,
-                        iteration,
-                        room_id
-                    )
-                break
-
-            logger.warning(
-                "Iteration %d: Found %d outlier forward extremities to upgrade in room %s: %s",
-                iteration + 1,
-                len(outlier_extremities_to_upgrade),
-                room_id,
-                [e.event_id for e in outlier_extremities_to_upgrade]
-            )
-
-            # Upgrade these outlier extremities
-            for extremity_event in outlier_extremities_to_upgrade:
-                logger.warning(
-                    "Upgrading outlier forward extremity %s",
-                    extremity_event.event_id
-                )
-                try:
-                    context = await self._state_handler.compute_event_context(extremity_event)
-                    await self._federation_event_handler.persist_events_and_notify(
-                        room_id,
-                        [(extremity_event, context)],
-                        backfilled=False
-                    )
-                    logger.warning(
-                        "Successfully upgraded outlier extremity %s",
-                        extremity_event.event_id
-                    )
-                    total_upgraded += 1
-                except Exception as e:
-                    logger.error(
-                        "Failed to upgrade outlier extremity %s: %s",
-                        extremity_event.event_id,
-                        e
-                    )
-                    raise
-
-        if iteration >= max_iterations - 1:
-            raise Exception(
-                f"Hit maximum iterations ({max_iterations}) while upgrading outlier extremities in room {room_id}"
-            )
-
-        # Get final forward extremities after all upgrades
+        # CRITICAL: Delete ALL outlier forward extremities before processing
+        # This prevents KeyError when events reference outlier extremities
         forward_extremity_ids = set(await self._store.get_all_forward_extremity_ids_for_room(room_id))
 
-        outlier_extremity_events = []
-        non_extremity_events = []
+        outliers_deleted = 0
+        for extremity_id in forward_extremity_ids:
+            extremity_event = await self._store.get_event(extremity_id, allow_none=True)
+            if extremity_event and extremity_event.internal_metadata.is_outlier():
+                logger.warning(
+                    "Deleting outlier forward extremity %s before processing batch",
+                    extremity_id
+                )
+                await self._store.db_pool.simple_delete(
+                    table="events",
+                    keyvalues={"event_id": extremity_id},
+                    desc="delete_outlier_extremity_for_disaster_recovery",
+                )
+                outliers_deleted += 1
 
-        # Now reorder events in this batch to process outlier extremities first
-        for event in events:
-            if event.event_id in forward_extremity_ids:
-                # Check if it's an outlier
-                existing = await self._store.get_event(event.event_id, allow_none=True)
-                if existing and existing.internal_metadata.is_outlier():
-                    outlier_extremity_events.append(event)
-                    logger.warning(
-                        "Event %s is an outlier forward extremity, will process first",
-                        event.event_id
-                    )
-                else:
-                    non_extremity_events.append(event)
-            else:
-                non_extremity_events.append(event)
-
-        # Process outlier extremities first, then everything else
-        events_to_process = outlier_extremity_events + non_extremity_events
-
-        if outlier_extremity_events:
+        if outliers_deleted > 0:
             logger.warning(
-                "Reordered batch to process %d outlier forward extremities first in room %s",
-                len(outlier_extremity_events),
+                "Deleted %d outlier forward extremities in room %s",
+                outliers_deleted,
                 room_id
             )
+
+        events_to_process = events
 
         # Process events using federation handler
         # This handles all the complexity of state resolution, persistence, etc.
@@ -1474,17 +1399,23 @@ class BulkEventInjectionServlet(RestServlet):
                 # This avoids "No forward extremities left" errors and database inconsistency
                 existing_event = await self._store.get_event(event.event_id, allow_none=True)
                 if existing_event:
-                    # If event exists as an outlier (e.g., from backfill or previous incomplete upload),
-                    # we need to re-process it to upgrade it to a non-outlier with proper state.
-                    # This handles the case where a room was partially imported from a snapshot
-                    # and we're now doing a complete disaster recovery import.
                     if existing_event.internal_metadata.is_outlier():
+                        # Event exists as an outlier (from snapshot backfill). We cannot compute
+                        # context for outliers (assertion at state/__init__.py:321), so we must
+                        # delete it first and re-insert with proper state.
+                        # This mimics federation behavior: outliers are treated as "missing" and
+                        # fetched fresh with state resolution.
                         logger.warning(
-                            "Event %s already exists as outlier in room %s, re-processing to upgrade with state",
+                            "Event %s exists as outlier in room %s, deleting to re-insert with state",
                             event.event_id,
                             room_id
                         )
-                        # Continue processing - Synapse's persist layer will handle the outlier upgrade
+                        await self._store.db_pool.simple_delete(
+                            table="events",
+                            keyvalues={"event_id": event.event_id},
+                            desc="delete_outlier_for_disaster_recovery",
+                        )
+                        # Continue to process the event fresh
                     else:
                         # Event already exists as non-outlier, skip
                         logger.warning(
@@ -1494,80 +1425,6 @@ class BulkEventInjectionServlet(RestServlet):
                         )
                         successfully_processed += 1
                         continue
-
-                # CRITICAL: Before computing context, upgrade any outlier forward extremities
-                # Processing events can create NEW outlier extremities, so we check before each event
-                logger.warning(
-                    "=== BEFORE processing event %s (depth %s) ===",
-                    event.event_id,
-                    event.depth
-                )
-
-                current_extremity_ids = set(await self._store.get_all_forward_extremity_ids_for_room(room_id))
-                logger.warning(
-                    "Current forward extremities (%d total): %s",
-                    len(current_extremity_ids),
-                    list(current_extremity_ids)
-                )
-
-                # Check which are outliers
-                for ext_id in current_extremity_ids:
-                    ext_event = await self._store.get_event(ext_id, allow_none=True)
-                    if ext_event:
-                        is_outlier = ext_event.internal_metadata.is_outlier()
-                        logger.warning(
-                            "  Extremity %s: depth=%s, outlier=%s",
-                            ext_id,
-                            ext_event.depth,
-                            is_outlier
-                        )
-
-                for upgrade_iteration in range(100):
-                    current_extremity_ids = set(await self._store.get_all_forward_extremity_ids_for_room(room_id))
-
-                    outliers_found = []
-                    for ext_id in current_extremity_ids:
-                        ext_event = await self._store.get_event(ext_id, allow_none=True)
-                        if ext_event and ext_event.internal_metadata.is_outlier():
-                            outliers_found.append(ext_event)
-
-                    if not outliers_found:
-                        if upgrade_iteration > 0:
-                            logger.warning("All outlier extremities upgraded after %d iterations", upgrade_iteration)
-                        break
-
-                    logger.warning(
-                        "Before processing %s (iteration %d): found %d outlier extremities to upgrade: %s",
-                        event.event_id,
-                        upgrade_iteration,
-                        len(outliers_found),
-                        [e.event_id for e in outliers_found]
-                    )
-
-                    for outlier_ext in outliers_found:
-                        logger.warning(
-                            "Upgrading outlier extremity %s (depth %s)",
-                            outlier_ext.event_id,
-                            outlier_ext.depth
-                        )
-                        ext_context = await self._state_handler.compute_event_context(outlier_ext)
-                        await self._federation_event_handler.persist_events_and_notify(
-                            room_id,
-                            [(outlier_ext, ext_context)],
-                            backfilled=False
-                        )
-                        logger.warning(
-                            "Successfully upgraded %s, checking if still outlier...",
-                            outlier_ext.event_id
-                        )
-                        # Verify upgrade
-                        upgraded = await self._store.get_event(outlier_ext.event_id, allow_none=True)
-                        if upgraded:
-                            logger.warning(
-                                "After upgrade: %s is_outlier=%s",
-                                outlier_ext.event_id,
-                                upgraded.internal_metadata.is_outlier()
-                            )
 
                 # Compute context BEFORE persisting
                 # This allows state resolution to see previously persisted events
