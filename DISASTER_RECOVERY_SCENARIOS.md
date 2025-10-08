@@ -4,8 +4,8 @@ This document outlines the disaster recovery scenarios covered by the Synapse bu
 
 ## Implementation Status
 
-**✅ Implemented & Tested (11 scenarios):**
-- Scenarios 1, 2, 4, 5, 6, 8, 10, 11, 12-14, 17, 22, 23
+**✅ Implemented & Tested (12 scenarios):**
+- Scenarios 1, 2, 4, 5, 6, 8, 10, 11, 12-14, 17, 22, 23, 24
 
 **❌ Removed (3 scenarios - based on incorrect assumptions):**
 - Scenarios 3, 7, 9: Assumed federation lacks required fields (INCORRECT - see EVENT_ID_PRESERVATION_RESEARCH.md)
@@ -337,6 +337,42 @@ See EVENT_ID_PRESERVATION_RESEARCH.md for spec citations and technical details.
 
 **Why This Matters:** When importing rooms into a fresh Synapse instance, the server processes invite events before join events for local users. This triggers a code path where the server is simultaneously "in the room" (user has joined) but has empty current state (deleted when processing invite). The fix ensures bulk injection handles this edge case correctly.
 
+## Scenario 24: Room Version 12 (MSC4291: Room IDs as Hashes)
+
+**Test Location:** `test_disaster_recovery_integration.py::test_room_version_12()`
+
+**Current Status:** ✅ IMPLEMENTED - Tests room v12+ functionality
+
+1. User creates a room using room version 12 (MSC4291: room IDs as hashes)
+2. In room v12+, `room_id` is derived from create event's `event_id` with '!' prefix instead of '$'
+3. **Server database is backed up**
+4. More messages are sent in the room
+5. **Server crashes and database is restored from backup**
+6. Admin recovers events from database export (complete PDU data)
+7. **Admin injects events via bulk injection API**
+8. **Expected result:**
+   - Room v12 events are successfully injected
+   - `room_id` is properly validated against create event's `event_id`
+   - Room functionality is preserved
+
+**Critical Requirements:**
+- For room v12+, `room_id` MUST be present in event JSON
+- For create events, `room_id` must equal create event's `event_id` with '!' prefix
+- Synapse stores `room_id` as separate database column, uploader must add it to event JSON
+- Validation enforces room ID correctness to prevent desynchronization
+
+**Implementation:**
+- **Uploader** (`uploader/database.py`): Modified `get_room_events_ordered()` to add `room_id` to each event
+- **Synapse** (`synapse/rest/admin/rooms.py`): Added validation for room v12+:
+  - Enforces `room_id` presence with clear error message
+  - Validates `room_id` matches create event's `event_id` (with '!' prefix)
+  - Provides detailed error messages explaining MSC4291
+
+**Test Coverage:**
+1. Successful injection with correct `room_id`
+2. Verification that missing `room_id` causes appropriate error
+3. Verification that wrong `room_id` causes appropriate error
+
 ---
 
 ## Test Implementation Details
@@ -383,6 +419,7 @@ See EVENT_ID_PRESERVATION_RESEARCH.md for spec citations and technical details.
 ./dependencies/synapse/run_disaster_recovery_integration_test.sh current-state
 ./dependencies/synapse/run_disaster_recovery_integration_test.sh event-id
 ./dependencies/synapse/run_disaster_recovery_integration_test.sh invite-before-join
+./dependencies/synapse/run_disaster_recovery_integration_test.sh room-version-12
 
 # Run in container (from dependencies/synapse directory)
 podman run --rm -v ".:/synapse" -w /synapse --entrypoint="" localhost/synapse-dev:latest \

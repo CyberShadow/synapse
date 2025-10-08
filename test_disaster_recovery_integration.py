@@ -2158,6 +2158,117 @@ root:
             self.stop_synapse()
             print(f"\nTest files left in: {self.temp_dir}")
 
+    def test_room_version_12(self):
+        """Test room version 12 (MSC4291: room IDs as hashes).
+
+        In room v12+, room_id is calculated from the create event's event_id:
+        - Create event has event_id like $xyz...
+        - Room ID is !xyz... (same hash, but with ! prefix instead of $)
+
+        This test verifies:
+        1. Bulk injection works with correct room_id (using real events from database)
+        2. room_id is properly added to events and validated
+        """
+        print("\n=== TEST: Room Version 12 (MSC4291 room IDs as hashes) ===")
+
+        try:
+            self.setup()
+            self.start_synapse()
+            self.register_user()
+
+            # Create a room with version 12 using the API
+            print("\nCreating room with version 12...")
+            room_id = self.create_room(room_version="12")
+            print(f"Created room v12: {room_id}")
+
+            # Room v12 IDs start with ! (MSC4291)
+            assert room_id.startswith("!"), f"Room v12 ID should start with !, got: {room_id}"
+
+            # Send a test message
+            self.send_message(room_id, "Test message in v12 room")
+
+            # Export all events from database (complete PDUs with room_id)
+            all_events = self.get_events_from_database(room_id)
+            print(f"Exported {len(all_events)} events from v12 room")
+
+            # Verify all events have room_id field
+            for event in all_events:
+                assert "room_id" in event, \
+                    f"Event {event.get('event_id')} missing room_id field"
+                assert event["room_id"] == room_id, \
+                    f"Event has wrong room_id: {event['room_id']} != {room_id}"
+
+            print("✓ All events have correct room_id field")
+
+            # Find the create event and verify room_id matches its event_id
+            create_event = next((e for e in all_events if e.get("type") == "m.room.create"), None)
+            assert create_event is not None, "Create event not found"
+
+            create_event_id = create_event["event_id"]
+            expected_room_id = "!" + create_event_id[1:]  # Replace $ with !
+
+            print(f"\nCreate event_id: {create_event_id}")
+            print(f"Expected room_id: {expected_room_id}")
+            print(f"Actual room_id:   {room_id}")
+
+            assert room_id == expected_room_id, \
+                f"Room ID mismatch: {room_id} != {expected_room_id}"
+
+            print("✓ Room ID correctly derived from create event_id (MSC4291)")
+
+            # Stop Synapse and delete database
+            self.stop_synapse()
+            os.remove(self.db_path)
+
+            # Start fresh Synapse
+            print("\nStarting fresh Synapse instance...")
+            self._create_config()
+            self.start_synapse()
+            self.register_user()
+
+            # Inject all events to recreate the room
+            print(f"\nInjecting {len(all_events)} v12 events...")
+            response = self.inject_room_events(room_id, all_events)
+
+            print(f"Injection response: injected={response['injected_events']}, failed={response['failed_events']}")
+
+            if response["failed_events"] > 0:
+                print(f"Errors: {json.dumps(response.get('errors', []), indent=2)}")
+
+            assert response["injected_events"] > 0, \
+                f"Should have injected events. Errors: {response.get('errors', [])}"
+            assert response["failed_events"] == 0, \
+                f"Should have no failures. Errors: {response.get('errors', [])}"
+
+            print(f"✓ Successfully injected {response['injected_events']} v12 events")
+
+            # Verify the room was recreated with version 12
+            print("\nVerifying room version in database...")
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT room_version FROM rooms WHERE room_id = ?", (room_id,))
+            row = cursor.fetchone()
+            conn.close()
+
+            assert row is not None, f"Room {room_id} not found after injection"
+            room_version_in_db = row[0]
+            print(f"Room version in database: {room_version_in_db}")
+            assert room_version_in_db == "12", f"Expected room version 12, got {room_version_in_db}"
+
+            # Verify we can read messages
+            messages = self.get_room_messages(room_id)
+            message_bodies = [m.get("content", {}).get("body") for m in messages
+                            if m.get("type") == "m.room.message"]
+
+            assert "Test message in v12 room" in message_bodies, \
+                "Should be able to read messages from recovered v12 room"
+
+            print("\n✓ Room version 12 test passed (disaster recovery successful)")
+
+        finally:
+            self.stop_synapse()
+            print(f"\nTest files left in: {self.temp_dir}")
+
 
     def get_events_from_database(self, room_id: str) -> list:
         """Get complete events directly from the database (not via API).
@@ -2187,6 +2298,8 @@ root:
             event_json = json.loads(row[1])
             # Ensure event_id is included (required for disaster recovery)
             event_json['event_id'] = event_id
+            # Ensure room_id is included (required for room v12+)
+            event_json['room_id'] = room_id
             events.append(event_json)
 
         conn.close()
@@ -2503,6 +2616,7 @@ root:
             ("Room Version 1", "test_room_version_1"),
             ("Current State Updated After Injection", "test_current_state_updated_after_injection"),
             ("Invite Before Join (Sliding Sync)", "test_invite_before_join_sliding_sync"),
+            ("Room Version 12 (MSC4291)", "test_room_version_12"),
         ]
 
         passed = 0
@@ -2573,11 +2687,13 @@ if __name__ == "__main__":
             test.test_current_state_updated_after_injection()
         elif test_name == "invite-before-join":
             test.test_invite_before_join_sliding_sync()
+        elif test_name == "room-version-12":
+            test.test_room_version_12()
         elif test_name == "all":
             SynapseIntegrationTest.run_all_tests()
         else:
             print(f"Unknown test: {test_name}")
-            print("Available tests: basic, membership, timestamps, functionality, room-after-backup, minimal, missing-between, historical, encrypted, state-conflict, redaction, invite-only, event-id, error-reporting, room-version-1, current-state, invite-before-join, all")
+            print("Available tests: basic, membership, timestamps, functionality, room-after-backup, minimal, missing-between, historical, encrypted, state-conflict, redaction, invite-only, event-id, error-reporting, room-version-1, current-state, invite-before-join, room-version-12, all")
     else:
         # Default to running all tests
         SynapseIntegrationTest.run_all_tests()
