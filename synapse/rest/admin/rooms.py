@@ -1365,7 +1365,50 @@ class BulkEventInjectionServlet(RestServlet):
         forward_extremities = await self._store.get_forward_extremities_for_room(room_id)
         outlier_extremity_events = []
         non_extremity_events = []
+        event_ids_in_batch = {event.event_id for event in events}
 
+        # First, check for outlier forward extremities that are NOT in this batch
+        # These will cause KeyError during state resolution, so we need to upgrade them first
+        outlier_extremities_to_upgrade = []
+        for extremity_id in forward_extremities:
+            if extremity_id not in event_ids_in_batch:
+                extremity_event = await self._store.get_event(extremity_id, allow_none=True)
+                if extremity_event and extremity_event.internal_metadata.is_outlier():
+                    outlier_extremities_to_upgrade.append(extremity_event)
+
+        if outlier_extremities_to_upgrade:
+            logger.warning(
+                "Found %d outlier forward extremities not in batch that need upgrading in room %s: %s",
+                len(outlier_extremities_to_upgrade),
+                room_id,
+                [e.event_id for e in outlier_extremities_to_upgrade]
+            )
+            # Upgrade these outlier extremities first by re-processing them
+            for extremity_event in outlier_extremities_to_upgrade:
+                logger.warning(
+                    "Upgrading outlier forward extremity %s (not in batch) before processing batch",
+                    extremity_event.event_id
+                )
+                try:
+                    context = await self._state_handler.compute_event_context(extremity_event)
+                    await self._federation_event_handler.persist_events_and_notify(
+                        room_id,
+                        [(extremity_event, context)],
+                        backfilled=False
+                    )
+                    logger.warning(
+                        "Successfully upgraded outlier extremity %s",
+                        extremity_event.event_id
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Failed to upgrade outlier extremity %s: %s",
+                        extremity_event.event_id,
+                        e
+                    )
+                    raise
+
+        # Now reorder events in this batch to process outlier extremities first
         for event in events:
             if event.event_id in forward_extremities:
                 # Check if it's an outlier
