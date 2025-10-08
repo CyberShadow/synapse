@@ -1368,10 +1368,10 @@ class BulkEventInjectionServlet(RestServlet):
         max_iterations = 100  # Prevent infinite loops
 
         for iteration in range(max_iterations):
-            forward_extremities = await self._store.get_forward_extremities_for_room(room_id)
-            # forward_extremities is List[Tuple[event_id, state_group, depth, received_ts]]
-            # Extract just the event IDs for easier checking
-            forward_extremity_ids = {extremity[0] for extremity in forward_extremities}
+            # Get ALL forward extremities including outliers without state groups
+            # The old get_forward_extremities_for_room() uses INNER JOIN with event_to_state_groups
+            # which excludes outliers without state, causing KeyError
+            forward_extremity_ids = set(await self._store.get_all_forward_extremity_ids_for_room(room_id))
 
             # Find ALL outlier forward extremities (whether in batch or not)
             outlier_extremities_to_upgrade = []
@@ -1431,8 +1431,7 @@ class BulkEventInjectionServlet(RestServlet):
             )
 
         # Get final forward extremities after all upgrades
-        forward_extremities = await self._store.get_forward_extremities_for_room(room_id)
-        forward_extremity_ids = {extremity[0] for extremity in forward_extremities}
+        forward_extremity_ids = set(await self._store.get_all_forward_extremity_ids_for_room(room_id))
 
         outlier_extremity_events = []
         non_extremity_events = []
@@ -1504,8 +1503,7 @@ class BulkEventInjectionServlet(RestServlet):
                     event.depth
                 )
 
-                current_extremities = await self._store.get_forward_extremities_for_room(room_id)
-                current_extremity_ids = {ext[0] for ext in current_extremities}
+                current_extremity_ids = set(await self._store.get_all_forward_extremity_ids_for_room(room_id))
                 logger.warning(
                     "Current forward extremities (%d total): %s",
                     len(current_extremity_ids),
@@ -1525,8 +1523,7 @@ class BulkEventInjectionServlet(RestServlet):
                         )
 
                 for upgrade_iteration in range(100):
-                    current_extremities = await self._store.get_forward_extremities_for_room(room_id)
-                    current_extremity_ids = {ext[0] for ext in current_extremities}
+                    current_extremity_ids = set(await self._store.get_all_forward_extremity_ids_for_room(room_id))
 
                     outliers_found = []
                     for ext_id in current_extremity_ids:

@@ -124,3 +124,33 @@ class EventForwardExtremitiesStore(
             "get_forward_extremities_for_room",
             get_forward_extremities_for_room_txn,
         )
+
+    async def get_all_forward_extremity_ids_for_room(
+        self, room_id: str
+    ) -> List[str]:
+        """
+        Get ALL forward extremity event IDs for a room, including outliers without state groups.
+
+        This is needed for bulk injection to detect outlier extremities that would cause
+        KeyError during state resolution.
+
+        Returns:
+            A list of event IDs.
+        """
+
+        def get_all_forward_extremity_ids_txn(
+            txn: LoggingTransaction,
+        ) -> List[str]:
+            sql = """
+                SELECT event_id
+                FROM event_forward_extremities
+                WHERE room_id = ?
+            """
+
+            txn.execute(sql, (room_id,))
+            return [row[0] for row in txn.fetchall()]
+
+        return await self.db_pool.runInteraction(
+            "get_all_forward_extremity_ids_for_room",
+            get_all_forward_extremity_ids_txn,
+        )
