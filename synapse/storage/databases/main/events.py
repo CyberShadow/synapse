@@ -696,21 +696,41 @@ class PersistEventsStore:
                     # We have current state to work from
                     membership_snapshot_shared_insert_values["has_known_state"] = True
                 else:
-                    # We don't have any `current_state_events` anymore (previously
-                    # cleared out because of `no_longer_in_room`). This can happen if
-                    # one user is joined and another is invited (some non-join
-                    # membership). If the joined user leaves, we are `no_longer_in_room`
-                    # and `current_state_events` is cleared out. When the invited user
-                    # rejects the invite (leaves the room), we will end up here.
+                    # We don't have any `current_state_events`. This can happen in two cases:
                     #
-                    # In these cases, we should inherit the meta data from the previous
+                    # 1. Previously cleared out because of `no_longer_in_room`: If one user
+                    #    is joined and another is invited (some non-join membership), and the
+                    #    joined user leaves, we are `no_longer_in_room` and `current_state_events`
+                    #    is cleared out. When the invited user rejects the invite (leaves),
+                    #    we will end up here.
+                    #
+                    # 2. During bulk event injection for disaster recovery: If we're importing
+                    #    events and an invite is processed before any local user joins, the
+                    #    server is initially "not in room" (no joined users), causing state
+                    #    to be cleared. When the join is subsequently processed, we end up
+                    #    here with empty state but no_longer_in_room=False.
+                    #
+                    # In both cases, we should inherit the meta data from the previous
                     # snapshot so we shouldn't update any of the state values. When
                     # using sliding sync filters, this will prevent the room from
-                    # disappearing/appearing just because you left the room.
+                    # disappearing/appearing.
                     #
-                    # Ideally, we could additionally assert that we're only here for
-                    # valid non-join membership transitions.
-                    assert delta_state.no_longer_in_room
+                    # For case 1, we expect no_longer_in_room=True. For case 2 (bulk injection),
+                    # no_longer_in_room=False is valid and we should mark has_known_state=False.
+
+                    if not delta_state.no_longer_in_room:
+                        # Bulk injection case: we're in the room but don't have current state
+                        # (invite was processed before join, causing state deletion)
+                        logger.debug(
+                            "Sliding sync: no current_state_map for room %s but no_longer_in_room=False. "
+                            "Setting has_known_state=False (bulk injection case).",
+                            room_id,
+                        )
+
+                    # Mark that we don't have known state if we're still in the room but
+                    # don't have current state (bulk injection case)
+                    if not delta_state.no_longer_in_room:
+                        membership_snapshot_shared_insert_values["has_known_state"] = False
 
         # Handle gathering info for the `sliding_sync_joined_rooms` table
         #
