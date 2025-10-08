@@ -1498,6 +1498,32 @@ class BulkEventInjectionServlet(RestServlet):
 
                 # CRITICAL: Before computing context, upgrade any outlier forward extremities
                 # Processing events can create NEW outlier extremities, so we check before each event
+                logger.warning(
+                    "=== BEFORE processing event %s (depth %s) ===",
+                    event.event_id,
+                    event.depth
+                )
+
+                current_extremities = await self._store.get_forward_extremities_for_room(room_id)
+                current_extremity_ids = {ext[0] for ext in current_extremities}
+                logger.warning(
+                    "Current forward extremities (%d total): %s",
+                    len(current_extremity_ids),
+                    list(current_extremity_ids)
+                )
+
+                # Check which are outliers
+                for ext_id in current_extremity_ids:
+                    ext_event = await self._store.get_event(ext_id, allow_none=True)
+                    if ext_event:
+                        is_outlier = ext_event.internal_metadata.is_outlier()
+                        logger.warning(
+                            "  Extremity %s: depth=%s, outlier=%s",
+                            ext_id,
+                            ext_event.depth,
+                            is_outlier
+                        )
+
                 for upgrade_iteration in range(100):
                     current_extremities = await self._store.get_forward_extremities_for_room(room_id)
                     current_extremity_ids = {ext[0] for ext in current_extremities}
@@ -1509,23 +1535,42 @@ class BulkEventInjectionServlet(RestServlet):
                             outliers_found.append(ext_event)
 
                     if not outliers_found:
+                        if upgrade_iteration > 0:
+                            logger.warning("All outlier extremities upgraded after %d iterations", upgrade_iteration)
                         break
 
                     logger.warning(
-                        "Before processing %s: found %d outlier extremities to upgrade: %s",
+                        "Before processing %s (iteration %d): found %d outlier extremities to upgrade: %s",
                         event.event_id,
+                        upgrade_iteration,
                         len(outliers_found),
                         [e.event_id for e in outliers_found]
                     )
 
                     for outlier_ext in outliers_found:
-                        logger.warning("Upgrading outlier extremity %s", outlier_ext.event_id)
+                        logger.warning(
+                            "Upgrading outlier extremity %s (depth %s)",
+                            outlier_ext.event_id,
+                            outlier_ext.depth
+                        )
                         ext_context = await self._state_handler.compute_event_context(outlier_ext)
                         await self._federation_event_handler.persist_events_and_notify(
                             room_id,
                             [(outlier_ext, ext_context)],
                             backfilled=False
                         )
+                        logger.warning(
+                            "Successfully upgraded %s, checking if still outlier...",
+                            outlier_ext.event_id
+                        )
+                        # Verify upgrade
+                        upgraded = await self._store.get_event(outlier_ext.event_id, allow_none=True)
+                        if upgraded:
+                            logger.warning(
+                                "After upgrade: %s is_outlier=%s",
+                                outlier_ext.event_id,
+                                upgraded.internal_metadata.is_outlier()
+                            )
 
                 # Compute context BEFORE persisting
                 # This allows state resolution to see previously persisted events
