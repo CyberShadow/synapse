@@ -1359,42 +1359,50 @@ class BulkEventInjectionServlet(RestServlet):
             events[0].type if events else "none"
         )
 
-        # CRITICAL: Before processing any events, check if any are outlier forward extremities
+        # CRITICAL: Before processing any events, upgrade ALL outlier forward extremities
         # These must be processed FIRST to avoid KeyError during state resolution
         # This handles the case where events from a snapshot are outliers and forward extremities
-        forward_extremities = await self._store.get_forward_extremities_for_room(room_id)
-        # forward_extremities is List[Tuple[event_id, state_group, depth, received_ts]]
-        # Extract just the event IDs for easier checking
-        forward_extremity_ids = {extremity[0] for extremity in forward_extremities}
-
-        outlier_extremity_events = []
-        non_extremity_events = []
+        # We loop because upgrading extremities can reveal new extremities
         event_ids_in_batch = {event.event_id for event in events}
+        total_upgraded = 0
+        max_iterations = 100  # Prevent infinite loops
 
-        # First, check for ALL outlier forward extremities (whether in batch or not)
-        # These will cause KeyError during state resolution, so we need to upgrade them first
-        # This handles the scenario where a room has partial data from a snapshot with
-        # backfilled outlier events scattered at various depths
-        outlier_extremities_to_upgrade = []
-        for extremity_id in forward_extremity_ids:
-            extremity_event = await self._store.get_event(extremity_id, allow_none=True)
-            if extremity_event and extremity_event.internal_metadata.is_outlier():
-                # Upgrade ALL outlier extremities, regardless of whether they're in this batch
-                # This prevents cascading KeyErrors as we process events in depth order
-                outlier_extremities_to_upgrade.append(extremity_event)
+        for iteration in range(max_iterations):
+            forward_extremities = await self._store.get_forward_extremities_for_room(room_id)
+            # forward_extremities is List[Tuple[event_id, state_group, depth, received_ts]]
+            # Extract just the event IDs for easier checking
+            forward_extremity_ids = {extremity[0] for extremity in forward_extremities}
 
-        if outlier_extremities_to_upgrade:
+            # Find ALL outlier forward extremities (whether in batch or not)
+            outlier_extremities_to_upgrade = []
+            for extremity_id in forward_extremity_ids:
+                extremity_event = await self._store.get_event(extremity_id, allow_none=True)
+                if extremity_event and extremity_event.internal_metadata.is_outlier():
+                    outlier_extremities_to_upgrade.append(extremity_event)
+
+            if not outlier_extremities_to_upgrade:
+                # No more outlier extremities to upgrade
+                if total_upgraded > 0:
+                    logger.warning(
+                        "Finished upgrading %d outlier forward extremities in %d iterations for room %s",
+                        total_upgraded,
+                        iteration,
+                        room_id
+                    )
+                break
+
             logger.warning(
-                "Found %d outlier forward extremities that need upgrading in room %s before processing batch: %s",
+                "Iteration %d: Found %d outlier forward extremities to upgrade in room %s: %s",
+                iteration + 1,
                 len(outlier_extremities_to_upgrade),
                 room_id,
                 [e.event_id for e in outlier_extremities_to_upgrade]
             )
-            # Upgrade ALL outlier extremities first by re-processing them
-            # This prevents KeyError cascades when processing events in depth order
+
+            # Upgrade these outlier extremities
             for extremity_event in outlier_extremities_to_upgrade:
                 logger.warning(
-                    "Upgrading outlier forward extremity %s before processing batch",
+                    "Upgrading outlier forward extremity %s",
                     extremity_event.event_id
                 )
                 try:
@@ -1408,6 +1416,7 @@ class BulkEventInjectionServlet(RestServlet):
                         "Successfully upgraded outlier extremity %s",
                         extremity_event.event_id
                     )
+                    total_upgraded += 1
                 except Exception as e:
                     logger.error(
                         "Failed to upgrade outlier extremity %s: %s",
@@ -1415,6 +1424,18 @@ class BulkEventInjectionServlet(RestServlet):
                         e
                     )
                     raise
+
+        if iteration >= max_iterations - 1:
+            raise Exception(
+                f"Hit maximum iterations ({max_iterations}) while upgrading outlier extremities in room {room_id}"
+            )
+
+        # Get final forward extremities after all upgrades
+        forward_extremities = await self._store.get_forward_extremities_for_room(room_id)
+        forward_extremity_ids = {extremity[0] for extremity in forward_extremities}
+
+        outlier_extremity_events = []
+        non_extremity_events = []
 
         # Now reorder events in this batch to process outlier extremities first
         for event in events:
