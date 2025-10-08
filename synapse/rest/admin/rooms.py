@@ -1359,12 +1359,43 @@ class BulkEventInjectionServlet(RestServlet):
             events[0].type if events else "none"
         )
 
+        # CRITICAL: Before processing any events, check if any are outlier forward extremities
+        # These must be processed FIRST to avoid KeyError during state resolution
+        # This handles the case where events from a snapshot are outliers and forward extremities
+        forward_extremities = await self._store.get_forward_extremities_for_room(room_id)
+        outlier_extremity_events = []
+        non_extremity_events = []
+
+        for event in events:
+            if event.event_id in forward_extremities:
+                # Check if it's an outlier
+                existing = await self._store.get_event(event.event_id, allow_none=True)
+                if existing and existing.internal_metadata.is_outlier():
+                    outlier_extremity_events.append(event)
+                    logger.warning(
+                        "Event %s is an outlier forward extremity, will process first",
+                        event.event_id
+                    )
+                else:
+                    non_extremity_events.append(event)
+            else:
+                non_extremity_events.append(event)
+
+        # Process outlier extremities first, then everything else
+        events_to_process = outlier_extremity_events + non_extremity_events
+
+        if outlier_extremity_events:
+            logger.warning(
+                "Reordered batch to process %d outlier forward extremities first in room %s",
+                len(outlier_extremity_events),
+                room_id
+            )
+
         # Process events using federation handler
         # This handles all the complexity of state resolution, persistence, etc.
         # CRITICAL: Process events SEQUENTIALLY, not in batches
         # State resolution for later events depends on earlier events (especially create) being persisted first
         successfully_processed = 0
-        events_to_process = events
 
         for event in events_to_process:
             try:
@@ -1372,13 +1403,26 @@ class BulkEventInjectionServlet(RestServlet):
                 # This avoids "No forward extremities left" errors and database inconsistency
                 existing_event = await self._store.get_event(event.event_id, allow_none=True)
                 if existing_event:
-                    logger.info(
-                        "Event %s already exists in room %s, skipping (idempotent re-upload)",
-                        event.event_id,
-                        room_id
-                    )
-                    successfully_processed += 1
-                    continue
+                    # If event exists as an outlier (e.g., from backfill or previous incomplete upload),
+                    # we need to re-process it to upgrade it to a non-outlier with proper state.
+                    # This handles the case where a room was partially imported from a snapshot
+                    # and we're now doing a complete disaster recovery import.
+                    if existing_event.internal_metadata.is_outlier():
+                        logger.warning(
+                            "Event %s already exists as outlier in room %s, re-processing to upgrade with state",
+                            event.event_id,
+                            room_id
+                        )
+                        # Continue processing - Synapse's persist layer will handle the outlier upgrade
+                    else:
+                        # Event already exists as non-outlier, skip
+                        logger.warning(
+                            "Event %s already exists in room %s, skipping (idempotent re-upload)",
+                            event.event_id,
+                            room_id
+                        )
+                        successfully_processed += 1
+                        continue
 
                 # Compute context BEFORE persisting
                 # This allows state resolution to see previously persisted events
@@ -1394,6 +1438,20 @@ class BulkEventInjectionServlet(RestServlet):
 
                 # IMPORTANT: Wait for persistence to complete before processing next event
                 # This ensures the create event is fully visible before processing dependent events
+
+                # Verify if outlier was upgraded
+                if existing_event and existing_event.internal_metadata.is_outlier():
+                    updated_event = await self._store.get_event(event.event_id, allow_none=True)
+                    if updated_event and updated_event.internal_metadata.is_outlier():
+                        logger.error(
+                            "Event %s is STILL an outlier after persist! Outlier upgrade failed.",
+                            event.event_id
+                        )
+                    else:
+                        logger.warning(
+                            "Event %s successfully upgraded from outlier to non-outlier",
+                            event.event_id
+                        )
 
                 successfully_processed += 1
                 logger.debug("Successfully processed event %s", event.event_id)
