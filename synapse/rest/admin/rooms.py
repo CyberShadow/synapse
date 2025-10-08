@@ -1371,26 +1371,30 @@ class BulkEventInjectionServlet(RestServlet):
         non_extremity_events = []
         event_ids_in_batch = {event.event_id for event in events}
 
-        # First, check for outlier forward extremities that are NOT in this batch
+        # First, check for ALL outlier forward extremities (whether in batch or not)
         # These will cause KeyError during state resolution, so we need to upgrade them first
+        # This handles the scenario where a room has partial data from a snapshot with
+        # backfilled outlier events scattered at various depths
         outlier_extremities_to_upgrade = []
         for extremity_id in forward_extremity_ids:
-            if extremity_id not in event_ids_in_batch:
-                extremity_event = await self._store.get_event(extremity_id, allow_none=True)
-                if extremity_event and extremity_event.internal_metadata.is_outlier():
-                    outlier_extremities_to_upgrade.append(extremity_event)
+            extremity_event = await self._store.get_event(extremity_id, allow_none=True)
+            if extremity_event and extremity_event.internal_metadata.is_outlier():
+                # Upgrade ALL outlier extremities, regardless of whether they're in this batch
+                # This prevents cascading KeyErrors as we process events in depth order
+                outlier_extremities_to_upgrade.append(extremity_event)
 
         if outlier_extremities_to_upgrade:
             logger.warning(
-                "Found %d outlier forward extremities not in batch that need upgrading in room %s: %s",
+                "Found %d outlier forward extremities that need upgrading in room %s before processing batch: %s",
                 len(outlier_extremities_to_upgrade),
                 room_id,
                 [e.event_id for e in outlier_extremities_to_upgrade]
             )
-            # Upgrade these outlier extremities first by re-processing them
+            # Upgrade ALL outlier extremities first by re-processing them
+            # This prevents KeyError cascades when processing events in depth order
             for extremity_event in outlier_extremities_to_upgrade:
                 logger.warning(
-                    "Upgrading outlier forward extremity %s (not in batch) before processing batch",
+                    "Upgrading outlier forward extremity %s before processing batch",
                     extremity_event.event_id
                 )
                 try:
