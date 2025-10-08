@@ -1147,12 +1147,24 @@ class BulkEventInjectionServlet(RestServlet):
 
         # Look for create event
         create_event_dict = None
+        logger.info(
+            "Looking for create event in room %s among %d events. Event types: %s",
+            room_id,
+            len(events),
+            [e.get("type") for e in events[:10]]  # First 10 event types
+        )
         for event in events:
             if event.get("type") == EventTypes.Create and event.get("state_key") == "":
                 create_event_dict = event
+                logger.info("Found create event for room %s", room_id)
                 break
 
         if not create_event_dict:
+            logger.warning(
+                "No create event found for room %s. Events have these types: %s",
+                room_id,
+                [e.get("type") for e in events]
+            )
             raise SynapseError(
                 400,
                 f"Room {room_id} does not exist and no create event provided"
@@ -1267,6 +1279,41 @@ class BulkEventInjectionServlet(RestServlet):
                     "Event ID validated: %s",
                     original_event_id
                 )
+
+                # Validate room_id for room v12+ (MSC4291: room IDs as hashes)
+                # For room v12+, room_id MUST be present and match the create event's event_id
+                if room_version.event_format >= EventFormatVersions.ROOM_V11_HYDRA_PLUS:
+                    # Check if room_id is in event_dict
+                    provided_room_id = event_dict.get("room_id")
+                    if not provided_room_id:
+                        raise SynapseError(
+                            400,
+                            f"room_id is required in event JSON for room version {room_version.identifier}+. "
+                            f"Room v12+ uses MSC4291 where room_id is derived from the create event's event_id. "
+                            f"Synapse stores room_id as a separate database column, but the bulk injection API "
+                            f"requires it in the event JSON for validation. Ensure your uploader adds room_id to "
+                            f"each event.",
+                            Codes.BAD_JSON
+                        )
+
+                    # For create events in room v12+, validate room_id = event_id with ! prefix
+                    if event.type == EventTypes.Create and event.state_key == "":
+                        expected_room_id = "!" + event.event_id[1:]  # Replace $ with !
+                        if provided_room_id != expected_room_id:
+                            raise SynapseError(
+                                400,
+                                f"Room ID mismatch for room version {room_version.identifier} create event: "
+                                f"provided room_id {provided_room_id} but expected {expected_room_id} "
+                                f"(derived from create event_id {event.event_id}). "
+                                f"Room v12+ (MSC4291) requires room_id to be the create event's event_id "
+                                f"with '!' prefix instead of '$'. Rejecting to prevent room ID desynchronization.",
+                                Codes.BAD_JSON
+                            )
+                        logger.info(
+                            "Room ID validated for v12+ create event: %s = %s with ! prefix",
+                            provided_room_id,
+                            event.event_id
+                        )
 
                 events.append(event)
                     
