@@ -1363,6 +1363,10 @@ class BulkEventInjectionServlet(RestServlet):
         # These must be processed FIRST to avoid KeyError during state resolution
         # This handles the case where events from a snapshot are outliers and forward extremities
         forward_extremities = await self._store.get_forward_extremities_for_room(room_id)
+        # forward_extremities is List[Tuple[event_id, state_group, depth, received_ts]]
+        # Extract just the event IDs for easier checking
+        forward_extremity_ids = {extremity[0] for extremity in forward_extremities}
+
         outlier_extremity_events = []
         non_extremity_events = []
         event_ids_in_batch = {event.event_id for event in events}
@@ -1370,7 +1374,7 @@ class BulkEventInjectionServlet(RestServlet):
         # First, check for outlier forward extremities that are NOT in this batch
         # These will cause KeyError during state resolution, so we need to upgrade them first
         outlier_extremities_to_upgrade = []
-        for extremity_id in forward_extremities:
+        for extremity_id in forward_extremity_ids:
             if extremity_id not in event_ids_in_batch:
                 extremity_event = await self._store.get_event(extremity_id, allow_none=True)
                 if extremity_event and extremity_event.internal_metadata.is_outlier():
@@ -1410,7 +1414,7 @@ class BulkEventInjectionServlet(RestServlet):
 
         # Now reorder events in this batch to process outlier extremities first
         for event in events:
-            if event.event_id in forward_extremities:
+            if event.event_id in forward_extremity_ids:
                 # Check if it's an outlier
                 existing = await self._store.get_event(event.event_id, allow_none=True)
                 if existing and existing.internal_metadata.is_outlier():
